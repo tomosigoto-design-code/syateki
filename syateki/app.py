@@ -8,20 +8,24 @@ import numpy as np
 
 from . import config
 from .calibration import detect_projection_corners, load_corners, save_corners
-from .detector import detect_hit, score_for_point, warp_to_projector
+from .detector import HitTracker, find_hit, score_for_point, warp_to_projector
 from .game import COOLDOWN, GameState
 from .keys import decode_key
 from .render_monitor import BUTTONS, render_monitor
 from .render_projector import render_projector
+from .settings import load_offset, save_offset
 from . import sound
 
 WIN_CAM = "Camera Monitor (Control)"
 WIN_PROJ = "Projector View (Target)"
 
 CALIB_IDLE, CALIB_DARK, CALIB_FLASH = 0, 1, 2
+# O キーのワンクリック補正: 待機 → 着弾待ち → 投影画面のクリック待ち
+OFS_IDLE, OFS_WAIT_SHOT, OFS_WAIT_CLICK = 0, 1, 2
 
 _NUDGE = {"up": (0, -1), "w": (0, -1), "down": (0, 1), "s": (0, 1),
           "left": (-1, 0), "a": (-1, 0), "right": (1, 0), "d": (1, 0)}
+_OFFSET_KEYS = {"i": (0, -1), "k": (0, 1), "j": (-1, 0), "l": (1, 0)}
 
 
 def _in_rect(x, y, rect):
@@ -32,10 +36,17 @@ def _in_rect(x, y, rect):
 class App:
     """状態をすべて持つ。step() はウィンドウを使わないのでテストから呼べる。"""
 
-    def __init__(self, demo=False, corners_path=config.CONFIG_FILE):
+    def __init__(self, demo=False, corners_path=config.CONFIG_FILE,
+                 settings_path=config.SETTINGS_FILE):
         self.demo = demo
         self.corners_path = corners_path
         self.corners = load_corners(corners_path)
+        self.settings_path = settings_path
+        self.hit_offset = load_offset(settings_path)
+        self.tracker = HitTracker()
+        self.last_settled = None  # 直近の確定結果 (監視画面の表示用)
+        self.offset_step = OFS_IDLE
+        self.offset_ref = None    # ワンクリック補正: 検出した補正前の着弾点
         self.selected = 0
         self.click_step = -1      # 0〜3: 4点クリック設定中
         self.dragging = False
@@ -52,6 +63,7 @@ class App:
         """スコアと背景をリセット。quiet=True は角の設定変更に伴うリセット (音なし)。"""
         self.game.reset()
         self.bg_gray = None
+        self.tracker.reset()
         if not quiet:
             sound.play("reset")
         print("★ スコアと背景をリセットしました！")
@@ -70,6 +82,27 @@ class App:
 
     def save(self):
         save_corners(self.corners, self.corners_path)
+
+    def set_offset(self, dx, dy):
+        self.hit_offset = (int(dx), int(dy))
+        save_offset(self.hit_offset, self.settings_path)
+        print(f"★ 着弾補正 HIT_OFFSET = {self.hit_offset}")
+
+    def toggle_offset_mode(self):
+        if self.offset_step == OFS_IDLE:
+            self.offset_step = OFS_WAIT_SHOT
+            self.offset_ref = None
+            print("★ 着弾補正モード: 的を1発撃ち、投影画面で実際に当たった位置をクリック ([O] で中止)")
+        else:
+            self.offset_step = OFS_IDLE
+            print("★ 着弾補正モードを中止しました")
+
+    def _offset_shot(self, raw):
+        """補正モード中の着弾。補正前の位置を覚えてクリック待ちへ。"""
+        if self.offset_step == OFS_WAIT_SHOT:
+            self.offset_ref = raw
+            self.offset_step = OFS_WAIT_CLICK
+            print(f"★ 検出位置 (補正前) ({raw[0]:.0f}, {raw[1]:.0f})。投影画面で実際の着弾位置をクリック")
 
     def on_camera_mouse(self, event, x, y, flags, param=None):
         if event == cv2.EVENT_RBUTTONDOWN:
@@ -111,10 +144,15 @@ class App:
     def on_proj_mouse(self, event, x, y, flags, param=None, now=None):
         if event == cv2.EVENT_RBUTTONDOWN:
             self.reset_game()
+        elif event == cv2.EVENT_LBUTTONDOWN and self.offset_step == OFS_WAIT_CLICK:
+            rx, ry = self.offset_ref
+            self.offset_step = OFS_IDLE
+            self.set_offset(round(x - rx), round(y - ry))
         elif event == cv2.EVENT_LBUTTONDOWN and self.demo:
-            # デモ: クリック位置を着弾として扱う
+            # デモ: クリック位置を着弾として扱う (補正はかけない)
             if self.calib_step == CALIB_IDLE and self.game.ready:
-                self._register(x, y, time.time() if now is None else now)
+                if self._register(x, y, time.time() if now is None else now):
+                    self._offset_shot((float(x), float(y)))
 
     def handle_key(self, code):
         """キー1つを処理する。終了なら False。"""
@@ -139,6 +177,13 @@ class App:
             p[1] += dy * config.NUDGE_PX
             self.save()
             self.bg_gray = None  # 変換が変わるので背景を撮り直す
+            self.tracker.reset()
+        elif k in _OFFSET_KEYS:
+            dx, dy = _OFFSET_KEYS[k]
+            self.set_offset(self.hit_offset[0] + dx * config.OFFSET_STEP_PX,
+                            self.hit_offset[1] + dy * config.OFFSET_STEP_PX)
+        elif k == "o":
+            self.toggle_offset_mode()
         elif k == "f":
             self.toggle_fullscreen()
         return True
@@ -160,6 +205,17 @@ class App:
         print(f"★ ナーフ弾命中! 座標:({x}, {y}) -> +{score}点 (合計: {self.game.total_score})")
         sound.play(f"hit{score}")
         return score
+
+    def _on_settled(self, settled, now):
+        self.last_settled = settled
+        h = settled.hit
+        if h is None:
+            print(f"★ 弾を見失ったので無効 (lost, {settled.frames}f, SETTLE_LOST=drop)")
+            return
+        print(f"★ 着弾確定: {settled.reason} {settled.frames}f / {h.method} 橙{h.orange_px}px / "
+              f"補正前({h.raw[0]:.1f}, {h.raw[1]:.1f}) + offset{self.hit_offset} -> ({h.x}, {h.y})")
+        if self._register(h.x, h.y, now):
+            self._offset_shot(h.raw)
 
     def _calibration_step(self, cam_gray, now):
         if self.calib_step == CALIB_DARK:
@@ -188,6 +244,7 @@ class App:
                 warped_bgr, warped_gray = warp_to_projector(cam_frame, self.corners)
                 if self.bg_gray is None:
                     self.bg_gray = warped_gray.copy()
+                    self.tracker.reset()
             except Exception:
                 warped_bgr = warped_gray = None
 
@@ -198,9 +255,12 @@ class App:
                     self.bg_gray = warped_gray.copy()
             elif warped_bgr is not None and self.bg_gray is not None:
                 try:
-                    hit, dart_mask = detect_hit(self.bg_gray, warped_bgr, frame_gray=warped_gray)
-                    if hit is not None:
-                        self._register(hit[0], hit[1], now)
+                    hit, dart_mask = find_hit(self.bg_gray, warped_bgr, frame_gray=warped_gray,
+                                              offset=self.hit_offset)
+                    # 止まるまで追跡し、確定するまで COOLDOWN にも背景更新にも入らない
+                    settled = self.tracker.update(hit, now)
+                    if settled is not None:
+                        self._on_settled(settled, now)
                 except Exception as e:
                     print("Hit error:", e)
 
@@ -209,7 +269,10 @@ class App:
                                 self.game.cooldown_progress(now),
                                 self.calib_step == CALIB_FLASH, now)
         monitor = render_monitor(cam_frame, self.corners, self.selected, self.click_step,
-                                 warped_bgr, dart_mask, config.CORNER_LABELS, config.CORNER_COLORS)
+                                 warped_bgr, dart_mask, config.CORNER_LABELS, config.CORNER_COLORS,
+                                 settled=self.last_settled,
+                                 tracking_frames=self.tracker.seen,
+                                 offset=self.hit_offset, offset_step=self.offset_step)
         return proj, monitor
 
 
@@ -259,6 +322,8 @@ def print_help(demo):
     print(" 矢印 / WASD      : 選択中の角を2pxずつ移動")
     print(" [R] / 右クリック : スコアと背景をリセット")
     print(" [F]              : 投影画面の全画面切替")
+    print(" [I][K] / [J][L]  : 着弾補正を上下 / 左右に2pxずつ (settings.json に保存)")
+    print(" [O]              : 着弾補正モード (1発撃って投影画面で実際の位置をクリック)")
     print(" [ESC] / [Q]      : 終了")
     print("=========================================================")
 

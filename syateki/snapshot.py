@@ -62,15 +62,21 @@ def write_all(outdir):
     shots["05_calibrating"] = _proj(g2, t0 + 2.0, calibrating=True)
 
     cam, corners = dummy_camera()
-    from .detector import detect_hit, warp_to_projector, blur_gray
+    from .detector import Settled, blur_gray, find_hit, warp_to_projector
     warped, wg = warp_to_projector(cam, corners)
     bg_cam = cam.copy()
     cv2.rectangle(bg_cam, (330, 195), (365, 250), (70, 62, 58), -1)
-    _, mask = detect_hit(blur_gray(warp_to_projector(bg_cam, corners)[0]), warped, frame_gray=wg)
+    hit, mask = find_hit(blur_gray(warp_to_projector(bg_cam, corners)[0]), warped, frame_gray=wg)
+    settled = Settled(hit, "settled", config.SETTLE_FRAMES) if hit is not None else None
     shots["06_monitor"] = render_monitor(cam, corners, 1, -1, warped, mask,
-                                         config.CORNER_LABELS, config.CORNER_COLORS)
+                                         config.CORNER_LABELS, config.CORNER_COLORS,
+                                         settled=settled, offset=config.HIT_OFFSET)
     shots["07_monitor_click4"] = render_monitor(cam, corners, 1, 2, warped, mask,
-                                                config.CORNER_LABELS, config.CORNER_COLORS)
+                                                config.CORNER_LABELS, config.CORNER_COLORS,
+                                                tracking_frames=2, offset=config.HIT_OFFSET)
+    shots["08_monitor_offset"] = render_monitor(cam, corners, 1, -1, warped, mask,
+                                                config.CORNER_LABELS, config.CORNER_COLORS,
+                                                settled=settled, offset=(0, 4), offset_step=2)
 
     paths = []
     for name, img in shots.items():

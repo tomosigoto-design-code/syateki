@@ -7,3 +7,4 @@ Thumbs.db
 .pytest_cache/
 snapshots/
 sounds/
+settings.json

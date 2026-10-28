@@ -161,14 +161,47 @@ def _draw_preview(img, src, x, y, pw, ph, label, color, ui):
     cv2.putText(img, label, (x + 4, y + th + 3), FONT, s, (20, 20, 20), 1, AA)
 
 
+def _hit_status(settled, tracking_frames):
+    """DART SENSOR の下に出す1行。追跡中なら追跡フレーム数、確定後は方式と理由"""
+    if tracking_frames > 0:
+        return f"TRACKING {tracking_frames}f ...", GUIDE_HI
+    if settled is None:
+        return None, None
+    h = settled.hit
+    if h is None:
+        return f"DROPPED (lost {settled.frames}f)", (90, 90, 255)
+    how = f"ORANGE {h.orange_px}px" if h.method == "orange" else f"LOWEST (orange {h.orange_px}px)"
+    return f"{how} / {settled.reason} {settled.frames}f / ({h.x},{h.y})", (255, 255, 255)
+
+
+def _draw_hit_on_sensor(img, settled, mask_shape, x, y, pw, ph):
+    """DART SENSOR プレビュー上に着弾点 (○=補正後, ・=補正前) を描く"""
+    h = settled.hit if settled is not None else None
+    if h is None:
+        return
+    sx, sy = pw / mask_shape[1], ph / mask_shape[0]
+    fx, fy = int(x + h.x * sx), int(y + h.y * sy)
+    rx, ry = int(x + h.raw[0] * sx), int(y + h.raw[1] * sy)
+    cv2.circle(img, (rx, ry), 2, (255, 255, 255), -1, AA)
+    cv2.circle(img, (fx, fy), 6, GUIDE_HI, 1, AA)
+    cv2.line(img, (fx - 9, fy), (fx + 9, fy), GUIDE_HI, 1, AA)
+    cv2.line(img, (fx, fy - 9), (fx, fy + 9), GUIDE_HI, 1, AA)
+
+
 def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx: int,
                    click_step: int,
                    warped_bgr: np.ndarray | None,
                    dart_mask: np.ndarray | None,
-                   corner_labels: list[str], corner_colors: list[tuple]) -> np.ndarray:
+                   corner_labels: list[str], corner_colors: list[tuple],
+                   settled=None, tracking_frames: int = 0,
+                   offset: tuple[int, int] = (0, 0), offset_step: int = 0) -> np.ndarray:
     """カメラ監視画面を描画した BGR 画像を返す（入力は書き換えない）
 
     click_step: -1 なら通常表示。0〜3 なら「次に [n] をクリック」ガイドを表示
+    settled: 直近の確定結果 (detector.Settled)。DART SENSOR に着弾点と方式を出す
+    tracking_frames: 着弾候補を追跡中のフレーム数 (0 = 追跡していない)
+    offset: 現在の HIT_OFFSET。ガイド帯に出す
+    offset_step: 1 = 補正モードで着弾待ち、2 = 投影画面のクリック待ち
     """
     img = cv2.cvtColor(cam_frame, cv2.COLOR_GRAY2BGR) if cam_frame.ndim == 2 else cam_frame.copy()
     h, w = img.shape[:2]
@@ -190,7 +223,16 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
     if warped_bgr is not None:
         _draw_preview(img, warped_bgr, px, py, pw, ph, "WARPED", CYAN, ui)
     if dart_mask is not None:
-        _draw_preview(img, dart_mask, px, py + ph + m, pw, ph, "DART SENSOR", MASK_COLOR, ui)
+        sy0 = py + ph + m
+        _draw_preview(img, dart_mask, px, sy0, pw, ph, "DART SENSOR", MASK_COLOR, ui)
+        _draw_hit_on_sensor(img, settled, dart_mask.shape, px, sy0, pw, ph)
+        status, scol = _hit_status(settled, tracking_frames)
+        if status:
+            ss = _fit_scale(status, FONT_S, 0.4 * ui, 1, pw)
+            (tw, tht), base = cv2.getTextSize(status, FONT_S, ss, 1)
+            ty = sy0 + ph + 4 + tht
+            _darken_roi(img, px, ty - tht - 3, px + tw + 6, ty + base + 2, 0.7)
+            cv2.putText(img, status, (px + 3, ty), FONT_S, ss, scol, 1, AA)
 
     # 四隅ハンドル（プレビューより前面）
     for i, pt in enumerate(corners):
@@ -198,29 +240,36 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
                      selected=(not clicking and i == selected_idx), target=(clicking and i == click_step), ui=ui)
 
     # 下部ガイド帯
+    ofs = f"OFFSET {offset[0]:+d},{offset[1]:+d}"
+    emph = clicking or offset_step in (1, 2)  # ガイド帯を強調する
     if clicking:
         lab = corner_labels[click_step % len(corner_labels)]
         line1 = f">> CLICK {lab} CORNER <<"
         line2 = f"step {click_step + 1}/4  -  click the projected corner on this view"
         c1, c2 = GUIDE_HI, (255, 255, 255)
+    elif offset_step in (1, 2):
+        line1 = (">> OFFSET: SHOOT THE TARGET <<" if offset_step == 1
+                 else ">> OFFSET: CLICK THE REAL HIT ON PROJECTOR <<")
+        line2 = f"{ofs}  -  O: cancel"
+        c1, c2 = GUIDE_HI, (255, 255, 255)
     else:
         lab = corner_labels[selected_idx % len(corner_labels)] if corner_labels else ""
         line1 = "C: AUTO ALIGN / M: CLICK 4 / R: RESET / F: FULLSCREEN"
-        line2 = f"Drag corner / Arrows,WASD: fine-tune {lab}"
+        line2 = f"Drag corner / Arrows,WASD: fine-tune {lab} / {ofs} (IJKL, O: auto)"
         c1, c2 = (230, 255, 60), (210, 210, 210)
     max_w = w - 2 * m
-    s1 = _fit_scale(line1, FONT, (0.7 if clicking else 0.5) * ui, 2 if clicking else 1, max_w)
+    s1 = _fit_scale(line1, FONT, (0.7 if emph else 0.5) * ui, 2 if emph else 1, max_w)
     s2 = _fit_scale(line2, FONT_S, 0.45 * ui, 1, max_w)
     th1 = cv2.getTextSize(line1, FONT, s1, 1)[0][1]
     th2 = cv2.getTextSize(line2, FONT_S, s2, 1)[0][1]
     gap = int(8 * ui)
     bar_h = th1 + th2 + gap * 3
     _darken_roi(img, 0, h - bar_h, w, h, 0.65)
-    if clicking:
+    if emph:
         cv2.rectangle(img, (0, h - bar_h), (w - 1, h - 1), GUIDE_HI, 2)
     else:
         cv2.line(img, (0, h - bar_h), (w, h - bar_h), CYAN, 1, AA)
-    cv2.putText(img, line1, (m, h - bar_h + gap + th1), FONT, s1, c1, 2 if clicking else 1, AA)
+    cv2.putText(img, line1, (m, h - bar_h + gap + th1), FONT, s1, c1, 2 if emph else 1, AA)
     cv2.putText(img, line2, (m, h - gap), FONT_S, s2, c2, 1, AA)
 
     # ボタンは最前面

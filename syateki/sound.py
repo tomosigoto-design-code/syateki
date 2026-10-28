@@ -154,11 +154,45 @@ def _calib_ok():
     ]), tail=0.25)
 
 
+def _chip(freq, dur, kind="pulse", duty=0.25, decay=2.0, sustain=0.75, vib_from=None):
+    """帯域制限したパルス波/三角波 (倍音を足して作るのでエイリアスが出ない)。
+    vib_from 秒以降に軽いビブラートを掛ける。"""
+    t = _t(dur)
+    f = np.full(len(t), float(freq))
+    if vib_from is not None:
+        depth = 0.012 * np.clip((t - vib_from) / 0.08, 0, 1)
+        f *= 1 + depth * np.sin(2 * np.pi * 6.5 * t)
+    phase = 2 * np.pi * np.cumsum(f) / SR
+    s = np.zeros(len(t))
+    for k in range(1, int(16000 / freq) + 1):
+        if kind == "pulse":
+            s += 2 / (k * np.pi) * np.sin(k * np.pi * duty) * np.cos(k * phase)
+        elif k % 2:  # 三角波
+            s += 8 / np.pi ** 2 * (-1) ** ((k - 1) // 2) / k ** 2 * np.sin(k * phase)
+    amp = sustain + (1 - sustain) * np.exp(-25 * t)  # 頭だけ少し強い
+    return _shape(s, t, 0.003, decay, release=0.015) * amp
+
+
 def _reset():
-    return _reverb(_mix([
-        (k * 0.08, _fm_bell(_note(n), 0.2, ratio=1.0, index=0.5, decay=14, attack=0.008))
-        for k, n in enumerate([67, 64, 60])  # G4 E4 C4
-    ]), tail=0.15, mix=0.25)
+    """パチスロ風のオリジナルジングル (BPM 165、16分の跳ねるリズム)。"""
+    s16 = 60 / 165 / 4
+    # (開始16分, 長さ16分, MIDI): デン・デデ・デン・デレ → 決め
+    melody = [(0, 2, 67), (2, 1, 67), (3, 1, 69), (5, 2, 72), (7, 1, 74), (8, 1, 76)]
+    parts = []
+    for st, ln, n in melody:
+        parts.append((st * s16, 0.5 * _chip(_note(n), ln * s16 * 0.9, duty=0.25)))
+    # 決めの1音: C6 + 下に E5・G5 (デューティ50%)、ビブラートで伸ばして減衰
+    end = 10 * s16
+    parts.append((end, 0.5 * _chip(_note(84), 0.5, duty=0.25, decay=4.0, vib_from=0.1)))
+    for n in (76, 79):
+        parts.append((end, 0.2 * _chip(_note(n), 0.5, duty=0.5, decay=4.0, vib_from=0.1)))
+    # 三角波のベース: C3 / G2 / C3
+    for st, ln, n in [(0, 4, 48), (5, 4, 43), (10, 5, 48)]:
+        parts.append((st * s16, 0.6 * _chip(_note(n), ln * s16, kind="tri", decay=3.0 if st == 10 else 1.0)))
+    # コイン風の高音アクセント
+    parts.append((end + 0.02, 0.1 * _chip(_note(100), 0.06, duty=0.5, decay=20)))
+    parts.append((end + 0.08, 0.1 * _chip(_note(105), 0.18, duty=0.5, decay=18)))
+    return _mix(parts)
 
 
 def _finish(x, fade_in=0.002, fade_out=0.03):

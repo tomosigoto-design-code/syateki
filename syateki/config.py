@@ -37,9 +37,20 @@ HIT_AREA_MIN = 40       # 40 < area < 8000
 HIT_AREA_MAX = 8000
 TARGET_MASK_MARGIN = 15  # 判定領域 = r10 + 15
 ORANGE_MIN_PIXELS = 15   # 橙の画素がこれ以上あれば、その重心を着弾点にする
+# 橙が足りないときの着弾点: 輪郭の重心と最下点の混ぜ具合 (0=重心, 1=最下点)
+FALLBACK_BLEND = 0.5
 # 着弾点に足す補正 (投影座標px, (dx, dy))。会場でカメラ位置のせいで当たりが
 # ずれるときに使う。例: 実際より上に出るなら (0, 10)。
+# settings.json があればその値を使う (会場で I/J/K/L・O キーで調整して保存)。
 HIT_OFFSET = (0, 0)
+# 着弾の安定待ち: 候補が出ても即確定せず、止まるまで追跡する
+SETTLE_FRAMES = 3     # 連続このフレーム数、
+SETTLE_PX = 6         # 着弾点がこの距離 (投影座標px) 以内に収まったら確定
+SETTLE_GRACE = 3      # 追跡中、この連続フレーム数見えなければ「見失った」(飛行中のちらつき対策)
+SETTLE_LOST = "last"  # 途中で消えたら "last": 最後に見えた位置で確定 / "drop": 無効
+SETTLE_TIMEOUT = 0.5  # 追跡がこの秒数を超えたら、その時点の位置で確定
+SETTINGS_FILE = "settings.json"  # corners.json と同じくカレントディレクトリ
+OFFSET_STEP_PX = 2  # I/J/K/L で HIT_OFFSET を動かす量
 
 # フラッシュキャリブレーション
 CALIB_DIFF_THRESH = 35

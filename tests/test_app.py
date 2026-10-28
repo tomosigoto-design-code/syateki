@@ -2,6 +2,7 @@ import json
 
 import cv2
 import numpy as np
+import pytest
 
 from syateki import config
 from syateki.app import App
@@ -15,7 +16,17 @@ FULL = [[0, 0], [W, 0], [W, H], [0, H]]  # 恒等変換になる四隅
 def make_app(tmp_path, demo=False):
     p = tmp_path / "corners.json"
     p.write_text(json.dumps(FULL))
-    return App(demo=demo, corners_path=str(p)), p
+    return App(demo=demo, corners_path=str(p), settings_path=str(tmp_path / "settings.json")), p
+
+
+def bg_frame():
+    return np.full((H, W, 3), 120, np.uint8)
+
+
+def dart_frame(x, y):
+    f = bg_frame()
+    cv2.ellipse(f, (x, y), (8, 25), 0, 0, 360, (200, 80, 20), -1)
+    return f
 
 
 def test_decode_keys():
@@ -35,21 +46,156 @@ def test_decode_keys():
 
 def test_pipeline_detects_dart_and_cooldown(tmp_path):
     app, _ = make_app(tmp_path)
-    bg = np.full((H, W, 3), 120, np.uint8)
+    bg = bg_frame()
     t = 1000.0
     app.step(bg, t)  # 背景を撮る
-    dart = bg.copy()
-    cv2.ellipse(dart, (config.TARGET_CENTER[0], config.TARGET_CENTER[1] - 10), (8, 25), 0, 0, 360,
-                (200, 80, 20), -1)
-    proj, mon = app.step(dart, t + 0.03)
+    dart = dart_frame(config.TARGET_CENTER[0], config.TARGET_CENTER[1] - 10)
+    for i in range(config.SETTLE_FRAMES - 1):  # 止まるまでは確定しない
+        app.step(dart, t + 0.03 * (i + 1))
+        assert app.game.total_score == 0 and app.game.ready and app.tracker.tracking
+    t += 0.03 * config.SETTLE_FRAMES
+    proj, mon = app.step(dart, t)
     assert app.game.total_score == 100 and app.game.phase == COOLDOWN
+    assert app.last_settled.reason == "settled" and app.last_settled.frames == config.SETTLE_FRAMES
     assert proj.shape == (H, W, 3) and mon.shape == (H, W, 3)
     app.step(dart, t + 0.5)  # COOLDOWN 中は検出しない
     assert app.game.total_score == 100
-    app.step(dart, t + 0.03 + config.COOLDOWN_SEC)  # 終了: 今の映像を背景にする
+    app.step(dart, t + config.COOLDOWN_SEC)  # 終了: 今の映像を背景にする
     assert app.game.phase == READY
-    app.step(dart, t + 2.0)  # 弾が刺さったままでも二重計上しない
+    for i in range(5):  # 弾が刺さったままでも二重計上しない
+        app.step(dart, t + 2.0 + i * 0.03)
     assert app.game.total_score == 100 and len(app.game.hits) == 1
+
+
+def test_pipeline_scores_where_dart_stops(tmp_path):
+    """上から動いてきて止まった弾は、最初に見えた位置ではなく止まった位置で判定する。"""
+    from syateki.detector import blur_gray, find_hit
+    app, _ = make_app(tmp_path)
+    cx, cy = config.TARGET_CENTER
+    t = 0.0
+    app.step(bg_frame(), t)
+    # 最初のフレームは 10点圏 (cy-230)、止まるのは 100点圏 (cy-20)
+    path = [cy - 230, cy - 170, cy - 110, cy - 50] + [cy - 20] * config.SETTLE_FRAMES
+    for y in path:
+        t += 0.03
+        app.step(dart_frame(cx, y), t)
+    assert len(app.game.hits) == 1 and app.game.hits[0].score == 100
+    expect, _ = find_hit(blur_gray(bg_frame()), dart_frame(cx, cy - 20), offset=(0, 0))
+    assert (app.game.hits[0].x, app.game.hits[0].y) == (expect.x, expect.y)
+    assert app.last_settled.reason == "settled" and app.last_settled.frames == len(path)
+
+
+def test_pipeline_flicker_then_stop(tmp_path):
+    """飛行中に1フレーム検出が欠けても、最初の位置で確定せず止まった位置で判定する。"""
+    app, _ = make_app(tmp_path)
+    cx, cy = config.TARGET_CENTER
+    frames = [dart_frame(cx, cy - 230), bg_frame(), dart_frame(cx, cy - 120)] + \
+        [dart_frame(cx, cy - 20)] * config.SETTLE_FRAMES
+    app.step(bg_frame(), 0.0)
+    for i, f in enumerate(frames):
+        app.step(f, 0.03 * (i + 1))
+    assert app.last_settled.reason == "settled"
+    assert len(app.game.hits) == 1 and app.game.hits[0].score == 100
+
+
+@pytest.mark.parametrize("mode,score", [("last", 10), ("drop", 0)])
+def test_pipeline_one_frame_blip(tmp_path, monkeypatch, mode, score):
+    """1フレームだけ出て消えた弾 (跳ね返り): last は最後の位置で確定、drop は無効。"""
+    monkeypatch.setattr(config, "SETTLE_LOST", mode)
+    app, _ = make_app(tmp_path)
+    cx, cy = config.TARGET_CENTER
+    app.step(bg_frame(), 0.0)
+    app.step(dart_frame(cx + 200, cy), 0.03)
+    assert app.game.total_score == 0
+    for i in range(config.SETTLE_GRACE - 1):  # 猶予中はまだ確定しない
+        app.step(bg_frame(), 0.06 + 0.03 * i)
+        assert app.game.total_score == 0 and app.tracker.tracking
+    app.step(bg_frame(), 0.06 + 0.03 * config.SETTLE_GRACE)
+    assert app.game.total_score == score and app.last_settled.reason == "lost"
+    assert (app.last_settled.hit is None) == (mode == "drop")
+    assert app.game.ready == (mode == "drop")
+
+
+def test_offset_keys_save_and_reload(tmp_path):
+    app, _ = make_app(tmp_path)
+    assert app.hit_offset == tuple(config.HIT_OFFSET)
+    for key in "kkkl":            # 下に6, 右に2
+        assert app.handle_key(ord(key))
+    assert app.handle_key(ord("I"))  # 大文字も同じ (上に2)
+    assert app.handle_key(ord("j")) and app.handle_key(ord("l"))
+    assert app.hit_offset == (2, 4)
+    assert json.loads((tmp_path / "settings.json").read_text()) == {"hit_offset": [2, 4]}
+    assert app.corners == FULL and app.selected == 0  # 角は動かない
+    app2, _ = make_app(tmp_path)
+    assert app2.hit_offset == (2, 4)
+
+
+def test_offset_used_by_detection(tmp_path):
+    app, _ = make_app(tmp_path)
+    app.set_offset(0, 30)
+    cx, cy = config.TARGET_CENTER
+    app.step(bg_frame(), 0.0)
+    for i in range(config.SETTLE_FRAMES):
+        app.step(dart_frame(cx, cy - 10), 0.03 * (i + 1))
+    h = app.last_settled.hit
+    assert (h.x, h.y) == (int(h.raw[0]), int(h.raw[1] + 30))
+    assert app.game.hits[0].y == h.y
+
+
+def test_settings_load_broken_or_missing(tmp_path):
+    from syateki.settings import load_offset, save_offset
+    p = tmp_path / "settings.json"
+    assert load_offset(str(p)) == tuple(config.HIT_OFFSET)
+    p.write_text("{broken")
+    assert load_offset(str(p)) == tuple(config.HIT_OFFSET)
+    p.write_text(json.dumps({"other": 1}))
+    save_offset((-4, 6), str(p))
+    assert json.loads(p.read_text()) == {"other": 1, "hit_offset": [-4, 6]}
+    assert load_offset(str(p)) == (-4, 6)
+
+
+def test_one_click_offset_calibration(tmp_path):
+    from syateki.app import OFS_IDLE, OFS_WAIT_CLICK, OFS_WAIT_SHOT
+    app, _ = make_app(tmp_path)
+    cx, cy = config.TARGET_CENTER
+    assert app.handle_key(ord("o")) and app.offset_step == OFS_WAIT_SHOT
+    app.step(bg_frame(), 0.0)
+    for i in range(config.SETTLE_FRAMES):
+        app.step(dart_frame(cx, cy - 10), 0.03 * (i + 1))
+    assert app.offset_step == OFS_WAIT_CLICK
+    rx, ry = app.offset_ref
+    app.on_proj_mouse(cv2.EVENT_LBUTTONDOWN, int(rx) + 3, int(ry) - 8, 0)
+    assert app.offset_step == OFS_IDLE
+    assert app.hit_offset == (round(int(rx) + 3 - rx), round(int(ry) - 8 - ry))
+    assert json.loads((tmp_path / "settings.json").read_text())["hit_offset"] == list(app.hit_offset)
+    # 補正後の判定点 = クリックした位置
+    assert (int(rx + app.hit_offset[0]), int(ry + app.hit_offset[1])) == (int(rx) + 3, int(ry) - 8)
+    # O 2回で中止
+    app.handle_key(ord("o")), app.handle_key(ord("o"))
+    assert app.offset_step == OFS_IDLE
+
+
+def test_one_click_offset_in_demo(tmp_path):
+    app, _ = make_app(tmp_path, demo=True)
+    cx, cy = config.TARGET_CENTER
+    app.handle_key(ord("o"))
+    app.on_proj_mouse(cv2.EVENT_LBUTTONDOWN, cx, cy, 0, now=1.0)   # 着弾 (デモ)
+    app.on_proj_mouse(cv2.EVENT_LBUTTONDOWN, cx + 4, cy + 10, 0, now=1.1)  # 実際の位置
+    assert app.hit_offset == (4, 10) and len(app.game.hits) == 1
+
+
+def test_monitor_shows_tracking_and_offset(tmp_path):
+    """監視画面の新しい表示が落ちずに描ける (追跡中・確定後・補正モード)。"""
+    app, _ = make_app(tmp_path)
+    cx, cy = config.TARGET_CENTER
+    app.step(bg_frame(), 0.0)
+    _, m1 = app.step(dart_frame(cx, cy), 0.03)   # 追跡中
+    assert app.tracker.seen == 1
+    app.handle_key(ord("o"))
+    _, m2 = app.step(dart_frame(cx, cy), 0.06)
+    _, m3 = app.step(dart_frame(cx, cy), 0.09)   # 確定
+    assert app.last_settled is not None
+    assert not np.array_equal(m1, m3)
 
 
 def test_arrow_and_wasd_nudge(tmp_path):
