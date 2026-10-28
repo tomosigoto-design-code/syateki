@@ -1,5 +1,6 @@
 """投影画面の描画(3色リングの的 + 中継風スコアバー)。
 mode="fever" ではブルがパチンコ風に派手になり、2倍タイム(bonus_start〜bonus_until)は龍と炎のリングが出る。
+右下の常設ランプは、ブルで「ペカッ」と点灯する(normal は控えめ、fever は背景ごと)。
 
 状態は持たない。アニメーションは hits[].t と now だけから計算する。
 静的な部分(背景・ボード・スコアバーの枠・四隅マーカー)はサイズごとにキャッシュする。
@@ -163,6 +164,7 @@ def _build_static(w, h, center, radii):
         cv2.putText(bg, pts, (kx + 24, ky + 6), SIMPLEX, 0.45, (200, 200, 200), 1, AA)
 
     _draw_corners(bg, w, h)
+    _draw_lamp_off(bg, w, h)
     _text_center(bg, "C: AUTO ALIGN   /   RIGHT CLICK: RESET   /   F: FULLSCREEN",
                  w // 2, h - 18, SIMPLEX, 0.38, (88, 89, 92), 1)
 
@@ -724,8 +726,9 @@ def _draw_jackpot(frame, w, h, center, age):
     glyphs = _jackpot_glyphs(118)
     n = len(glyphs)
     total = sum(m.shape[0] for m, _ in glyphs) - 24 * n + 8 * (n - 1)
-    sc = min(1.0, (h - 70) / total, (w - 30 - x_l) / max(m.shape[1] for m, _ in glyphs))
-    y = (h - total * sc) / 2
+    top, bot = 40, h - 200            # 右下のランプを避ける
+    sc = min(1.0, (bot - top) / total, (w - 30 - x_l) / max(m.shape[1] for m, _ in glyphs))
+    y = top + (bot - top - total * sc) / 2
     for i, (m, e) in enumerate(glyphs):
         gh = (m.shape[0] - 24) * sc
         t = age - 0.05 - 0.08 * i
@@ -789,7 +792,7 @@ def _draw_fever_badge(frame, w, h, center, radii):
 def _draw_fever_outer(frame, w, h, center, radii, hit, age, streak, dragon=False, fire=False):
     """dragon=True(2倍タイム中)は龍と炎が主役なので、ブルの外側演出は省く(描画時間・輝度対策)。"""
     if not dragon:
-        _draw_sunburst(frame, center, age, wedges=not fire)   # 炎と重なるときは帯を省く(平均輝度対策)
+        _draw_sunburst(frame, center, age, wedges=False)   # 背景の色面はランプのペカりが担う(平均輝度対策)
     if not dragon:
         _draw_stars(frame, center, hit, age)
         _draw_confetti(frame, center, radii, hit, age, n=140 if fire else 200, palette=RAINBOW, a=_fever_fade(age),
@@ -1090,7 +1093,7 @@ def _draw_lightning(frame, glow, gs, center, t, seed, size=(1280, 720)):
                 cv2.polylines(frame, [_i32(bp)], False, _scale((255, 245, 250), a), 2, AA)
 
 
-_CLOUDS = ((-1, 175, 625, 1.0), (1, 1125, 95, 0.85), (-1, 1120, 640, 0.9))
+_CLOUDS = ((-1, 175, 625, 1.0), (1, 1125, 95, 0.85))       # 右下はランプがあるので置かない
 
 
 def _cloud_sprite(d, s_):
@@ -1378,6 +1381,138 @@ def _draw_bonus_bar(frame, w, h, center, radii, now, bonus_start, bonus_until):
     cv2.line(frame, (gx0, gy), (gx0 + int((gx1 - gx0) * rem / total), gy), (0, 130, 255), 3)
 
 
+# ---------------------------------------------------------------- lamp (ブルで「ペカッ」と光るランプ)
+# 右下に常設のオリジナルのランプ(丸い筐体 + ガラスに「BULL!」)。消灯時は静的画像に含めて静止。
+# ブル命中で 0.05 秒で点灯 → ゆっくり明滅 → 演出の終わりにふっと消える。背景(半径300の外)もランプの光で色づく。
+LAMP_W, LAMP_H = 150, 92
+LAMP_TEXT = "BULL!"
+PEKA_PINK = (170, 90, 255)
+PEKA_YELLOW = (70, 225, 255)
+
+
+def _lamp_center(w, h):
+    return w - 142, h - 132
+
+
+def _lamp_glass_mask(w, h):
+    """ガラス部分(角の丸いドーム)の 1ch マスクと、その外接矩形。"""
+    key = ("lampmask", w, h)
+    if key not in _glyph_cache:
+        cx, cy = _lamp_center(w, h)
+        x0, y0 = cx - LAMP_W // 2, cy - LAMP_H // 2
+        m = np.zeros((LAMP_H, LAMP_W), np.uint8)
+        r = LAMP_H // 2
+        cv2.ellipse(m, (LAMP_W // 2, r), (LAMP_W // 2 - 1, r - 1), 0, 180, 360, 255, -1, AA)   # 上はドーム
+        cv2.rectangle(m, (1, r), (LAMP_W - 2, LAMP_H - 1), 255, -1)
+        _glyph_cache[key] = (m, (x0, y0))
+    return _glyph_cache[key]
+
+
+def _draw_lamp_body(img, w, h, glass, text_col, edge_col=(90, 90, 96)):
+    """ランプ一式(台座・ガラス・文字)。glass は BGR か (LAMP_H, LAMP_W, 3) の色画像。"""
+    cx, cy = _lamp_center(w, h)
+    m, (x0, y0) = _lamp_glass_mask(w, h)
+    # 台座(クロームの帯)
+    cv2.rectangle(img, (x0 - 8, y0 + LAMP_H - 4), (x0 + LAMP_W + 7, y0 + LAMP_H + 14), (52, 52, 56), -1)
+    cv2.rectangle(img, (x0 - 8, y0 + LAMP_H - 4), (x0 + LAMP_W + 7, y0 + LAMP_H - 1), (120, 120, 128), -1)
+    for k in range(5):                                  # 台座のねじ
+        cv2.circle(img, (x0 + 6 + k * (LAMP_W - 12) // 4, y0 + LAMP_H + 7), 2, (95, 95, 100), -1, AA)
+    roi = img[y0:y0 + LAMP_H, x0:x0 + LAMP_W]
+    src = np.ascontiguousarray(glass) if isinstance(glass, np.ndarray) else np.full_like(roi, glass)
+    cv2.copyTo(src, m, roi)
+    # 縁取りとガラスの映り込み
+    r = LAMP_H // 2
+    cv2.ellipse(img, (cx, y0 + r), (LAMP_W // 2, r), 0, 180, 360, edge_col, 2, AA)
+    cv2.line(img, (x0, y0 + r), (x0, y0 + LAMP_H - 2), edge_col, 2, AA)
+    cv2.line(img, (x0 + LAMP_W - 1, y0 + r), (x0 + LAMP_W - 1, y0 + LAMP_H - 2), edge_col, 2, AA)
+    cv2.ellipse(img, (cx - 22, y0 + 22), (34, 9), -12, 200, 330, (200, 200, 205) if isinstance(glass, np.ndarray)
+                else (75, 70, 80), 2, AA)
+    _text_center(img, LAMP_TEXT, cx, cy + 10, DUPLEX, 1.05, text_col, 2)
+
+
+def _draw_lamp_off(img, w, h):
+    _draw_lamp_body(img, w, h, (40, 30, 46), (78, 62, 92))
+
+
+def _peka_level(age, end):
+    """点灯の強さ。0.05 秒でパッと点き、ゆっくり明滅し、終わりの 0.35 秒でふっと消える。"""
+    if age < 0:
+        return 0.0
+    on = min(1.0, age / 0.05)
+    blink = 0.82 + 0.18 * math.cos(2 * math.pi * 1.6 * age)
+    out = min(1.0, max(0.0, (end - age) / 0.35))
+    return on * blink * out
+
+
+def _peka_tints(w, h):
+    """ランプから背景へ広がる光(ピンク・黄)の加算用画像。サイズごとにキャッシュ。"""
+    key = ("peka", w, h)
+    if key not in _glyph_cache:
+        cx, cy = _lamp_center(w, h)
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        d = np.hypot(xx - cx, yy - cy)
+        f = np.clip(1 - d / 1100, 0, 1) ** 2.2
+        ang = np.arctan2(yy - cy, xx - cx)
+        rays = 0.55 + 0.45 * np.cos(ang * 14) ** 2                     # 放射状の筋
+        out = []
+        for col in (PEKA_PINK, PEKA_YELLOW):
+            out.append((f[..., None] * np.array(col, np.float32)).astype(np.uint8))
+            out.append((f[..., None] * rays[..., None] * np.array(col, np.float32)).astype(np.uint8))
+        _glyph_cache[key] = out
+    return _glyph_cache[key]
+
+
+def _draw_peka(frame, w, h, age, end, fever, bg=True):
+    """ペカり: 背景の光 → 点灯したランプ → ランプ周りの光の輪とトゲ。"""
+    lv = _peka_level(age, end)
+    if lv <= 0:
+        return
+    cx, cy = _lamp_center(w, h)
+    if bg:
+        pink, pink_r, yel, yel_r = _peka_tints(w, h)
+        burst = 1 + 0.3 * max(0.0, 1 - age / 0.25)
+        if fever:      # 背景全体: 放射の筋の入った光が、ピンクと黄で交互に脈打つ
+            tint = pink_r if int(age * 3.2) % 2 else yel_r
+            cv2.addWeighted(frame, 1.0, tint, 0.2 * lv * (1 + 0.5 * (burst - 1)), 0, dst=frame)
+        else:          # 控えめ: ほんのり
+            cv2.addWeighted(frame, 1.0, pink, 0.08 * lv * burst, 0, dst=frame)
+    # ランプ周りの光の輪(点いた瞬間は大きく)。2倍タイム中(bg=False)は龍と炎で明るいので省く
+    if bg:
+        burst = max(0.0, 1 - age / 0.3)
+        halo_r = int(95 + 70 * burst)
+        mg = int(halo_r * 1.3) + 30                       # トゲ(1.25倍)とぼかしの裾まで入る大きさ
+        x0, y0 = max(0, cx - mg), max(0, cy - mg)
+        x1, y1 = min(w, cx + mg), min(h, cy + mg)
+        q = 2                                              # 半分の解像度で描いてぼかし、拡大して加算
+        lay = np.zeros(((y1 - y0) // q, (x1 - x0) // q, 3), np.uint8)
+        col = _hue(age * 160) if fever else PEKA_PINK
+        oc = ((cx - x0) // q, (cy - y0) // q)
+        cv2.circle(lay, oc, halo_r // q, _scale(col, 0.55 * lv), -1)
+        n = 16
+        for i in range(n):                               # トゲ(回る光の筋)
+            th = i * 2 * math.pi / n + age * (1.2 if fever else 0.5)
+            L = halo_r * (1.25 if i % 2 else 1.0) / q
+            cv2.line(lay, oc, (int(oc[0] + math.cos(th) * L), int(oc[1] + math.sin(th) * L)),
+                     _scale(PEKA_YELLOW if i % 2 else col, 0.8 * lv), 2)
+        lay = cv2.resize(cv2.GaussianBlur(lay, (0, 0), 4.5), (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+        roi = frame[y0:y1, x0:x1]
+        cv2.add(roi, lay, dst=roi)
+    # 点灯したランプ(ガラスはグラデーション、fever は虹色が流れる)
+    rows = np.arange(LAMP_H, dtype=np.float32)[:, None]
+    cols = np.arange(LAMP_W, dtype=np.float32)[None, :]
+    if fever:
+        hue = ((rows * 0.9 + cols * 0.5 + age * 220) % 180).astype(np.int32)
+        glass = _HUE_LUT[hue].astype(np.float32)
+        glass = glass * 0.55 + 255 * 0.45                 # 白っぽく明るいガラス
+    else:
+        t_ = np.clip(rows / LAMP_H, 0, 1)[..., None]
+        glass = np.array(PEKA_YELLOW, np.float32) * (1 - t_) + np.array(PEKA_PINK, np.float32) * t_
+        glass = np.broadcast_to(glass, (LAMP_H, LAMP_W, 3)) * 0.8 + 255 * 0.2
+    dim = 0.55 + 0.45 * lv
+    glass = (glass * dim).clip(0, 255).astype(np.uint8)
+    _draw_lamp_body(frame, w, h, glass, (60, 10, 150), (210, 210, 220))
+
+
 # ---------------------------------------------------------------- main
 def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, int, int],
                      total_score: int, hits: list[Hit],
@@ -1421,6 +1556,8 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
             _draw_rays(frame, center, age)
             _draw_confetti(frame, center, radii, hit, age)
             _draw_telop(frame, w, h, center, radii, age, streak)
+    if bull:    # ペカり(背景の光は 2倍タイム中は省く: 龍と炎で十分明るい)
+        _draw_peka(frame, w, h, bull[1], FEVER_END if fever else BULL_END, fever, bg=not bonus)
     if bonus:   # 炎は加算なので、バーストの後に重ねる。龍は bonus_until まで舞い、終了前に去る
         tb, total = now - bonus_start, bonus_until - bonus_start
         glow = np.zeros((h // 4, w // 4, 3), np.uint8)   # 龍・炎・宝珠・稲妻の共通グロー(1/4 解像度)
@@ -1441,8 +1578,8 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
         _draw_bonus_bar(frame, w, h, center, radii, now, bonus_start, bonus_until)
     if fever:
         _draw_fever_badge(frame, w, h, center, radii)
-        if outer:
-            _draw_corners(frame, w, h)
+    if outer:      # 演出の下に隠れないよう、四隅マーカーは最後に描き直す
+        _draw_corners(frame, w, h)
     if outer:
         box = (center[0] - QUIET_R, center[1] - QUIET_R, center[0] + QUIET_R + 1, center[1] + QUIET_R + 1)
     sl = (slice(max(0, box[1]), min(h, box[3] + 1)), slice(max(0, box[0]), min(w, box[2] + 1)))

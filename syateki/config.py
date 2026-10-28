@@ -55,6 +55,7 @@ OFFSET_STEP_PX = 2  # I/J/K/L で HIT_OFFSET を動かす量
 # フラッシュキャリブレーション
 CALIB_DIFF_THRESH = 35
 CALIB_MIN_AREA = 8000
+DARK_WAIT_SEC = 0.2      # 投影を真っ黒にしてから暗フレームを撮るまで待つ (カメラ遅延)
 FLASH_WAIT_SEC = 0.25    # 白点灯後、カメラ露出が安定するまで待つ
 
 COOLDOWN_SEC = 1.2       # 命中後、次の検出までの時間

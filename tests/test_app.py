@@ -250,17 +250,30 @@ def test_demo_click_scores(tmp_path):
     assert app.game.total_score == 0
 
 
-def test_auto_calibration_flow(tmp_path):
+def test_auto_calibration_flow(tmp_path, monkeypatch):
+    from syateki import app as app_mod
     app, p = make_app(tmp_path)
     cam = np.full((480, 640, 3), 30, np.uint8)
-    app.start_auto_calibration(now=0.0)
-    proj, _ = app.step(cam, 0.0)        # 暗フレーム
-    proj, _ = app.step(cam, 0.1)        # 白点灯中
-    assert proj.mean() > 250
-    lit = cam.copy()
     quad = [(100, 70), (540, 80), (560, 410), (90, 400)]
+    lit = cam.copy()
     cv2.fillPoly(lit, [np.int32(quad)], (230, 230, 230))
-    app.step(lit, 0.3)
+    showing = lit.copy()  # 派手な演出がまだ写っているカメラ画像 (暗フレームに使ってはいけない)
+
+    calls = []
+    real = app_mod.render_projector
+    monkeypatch.setattr(app_mod, "render_projector",
+                        lambda *a, **kw: calls.append(1) or real(*a, **kw))
+    app.start_auto_calibration(now=0.0)
+    for t in (0.0, 0.1, 0.19):                  # 投影は真っ黒、まだ暗フレームは撮らない
+        proj, _ = app.step(showing, t)
+        assert app.calib_step == app_mod.CALIB_DARK and proj.max() == 0 and not calls
+    assert app.dark_gray is None
+    proj, _ = app.step(cam, config.DARK_WAIT_SEC)  # 待った後に暗フレーム → 白点灯
+    assert app.calib_step == app_mod.CALIB_FLASH and proj.mean() > 250
+    t1 = config.DARK_WAIT_SEC
+    proj, _ = app.step(cam, t1 + 0.1)           # 白点灯中 (露出待ち)
+    assert proj.mean() > 250
+    app.step(lit, t1 + config.FLASH_WAIT_SEC + 0.05)
     assert app.calib_step == 0
     for (fx, fy), (qx, qy) in zip(app.corners, quad):
         assert abs(fx - qx) <= 6 and abs(fy - qy) <= 6

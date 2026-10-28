@@ -251,8 +251,16 @@ class App:
         if self._register(h.x, h.y, now):
             self._offset_shot(h.raw)
 
+    def _render_projector(self, now):
+        args = (config.PROJ_W, config.PROJ_H, config.TARGET_CENTER, config.RADII,
+                self.game.total_score, self.game.hits, self.game.cooldown_progress(now),
+                self.calib_step == CALIB_FLASH, now)
+        return _call_projector(args, mode=self.mode, bonus_start=self.game.bonus_start,
+                               bonus_until=self.game.bonus_until)
+
     def _calibration_step(self, cam_gray, now):
-        if self.calib_step == CALIB_DARK:
+        # 暗フレームは投影を真っ黒にして DARK_WAIT_SEC 待ってから撮る (演出の色が差分を潰さないように)
+        if self.calib_step == CALIB_DARK and now - self.calib_start >= config.DARK_WAIT_SEC:
             self.dark_gray = cam_gray.copy()
             self.calib_step = CALIB_FLASH
             self.calib_start = now
@@ -303,11 +311,10 @@ class App:
                 except Exception as e:
                     print("Hit error:", e)
 
-        args = (config.PROJ_W, config.PROJ_H, config.TARGET_CENTER, config.RADII,
-                self.game.total_score, self.game.hits, self.game.cooldown_progress(now),
-                self.calib_step == CALIB_FLASH, now)
-        proj = _call_projector(args, mode=self.mode, bonus_start=self.game.bonus_start,
-                               bonus_until=self.game.bonus_until)
+        if self.calib_step == CALIB_DARK:
+            proj = np.zeros((config.PROJ_H, config.PROJ_W, 3), np.uint8)
+        else:
+            proj = self._render_projector(now)
         monitor = render_monitor(cam_frame, self.corners, self.selected, self.click_step,
                                  warped_bgr, dart_mask, config.CORNER_LABELS, config.CORNER_COLORS,
                                  settled=self.last_settled,
