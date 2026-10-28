@@ -77,6 +77,9 @@ def write_all(outdir):
     shots["08_monitor_offset"] = render_monitor(cam, corners, 1, -1, warped, mask,
                                                 config.CORNER_LABELS, config.CORNER_COLORS,
                                                 settled=settled, offset=(0, 4), offset_step=2)
+    shots["09_monitor_fever"] = render_monitor(cam, corners, 1, -1, warped, mask,
+                                               config.CORNER_LABELS, config.CORNER_COLORS,
+                                               settled=settled, mode="fever")
 
     paths = []
     for name, img in shots.items():

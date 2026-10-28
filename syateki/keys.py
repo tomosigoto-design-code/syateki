@@ -13,7 +13,10 @@ _X11 = {0xFF52: "up", 0xFF54: "down", 0xFF51: "left", 0xFF53: "right"}
 
 
 def decode_key(code):
-    """'up'/'down'/'left'/'right'/'esc'/'tab'、または小文字1文字。無ければ None。"""
+    """'up'/'down'/'left'/'right'/'esc'/'tab'、または小文字1文字。無ければ None。
+
+    使用中の文字: c m r f q w a s d (角・操作) / i j k l o (着弾補正) / p (演出モード)
+    """
     if code is None or code < 0:
         return None
     if code in _WIN:

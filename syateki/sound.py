@@ -3,9 +3,17 @@
     init()            # 起動時に1回。WAV を書き出す
     play("hit100")    # すぐ返る。失敗しても例外を出さない
 
-名前: hit100 / hit50 / hit10 / calib_ok / calib_start / reset
+名前: hit100 / hit50 / hit10 / calib_ok / calib_start / reset / hit100_fever /
+      bonus_start / bonus_end
+キャッシュ済み WAV が揃っていて SOUND_VERSION が一致すれば合成を省く (音を変えたら上げる)。
 再生: Windows は winsound.PlaySound (SND_ASYNC)、Linux は aplay / paplay。
 どちらも無ければ無音。鳴っている途中の次の音は上書き。
+
+BGM (ボーナス中):
+    bgm_start()       # <repo>/bgm/ の最初の .mp3/.wav を config.BGM_START_SEC 秒から流す
+    bgm_stop()        # フェードアウトして止める
+曲ファイルがなければ合成した bonus_bgm.wav を使う。Windows は MCI (winmm) で鳴らすので
+効果音 (PlaySound) と同時に鳴る。Linux は ffplay (なければ paplay、wav のみ)。
 """
 import os
 import platform
@@ -14,13 +22,16 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 
 import numpy as np
 
 SR = 44100
 PEAK = 10 ** (-3 / 20)  # -3 dBFS
-NAMES = ("hit100", "hit50", "hit10", "calib_ok", "calib_start", "reset")
+NAMES = ("hit100", "hit50", "hit10", "calib_ok", "calib_start", "reset", "hit100_fever",
+         "bonus_start", "bonus_end", "bonus_bgm")
+SOUND_VERSION = "2"
 
 winsound = None
 if platform.system() == "Windows":
@@ -154,8 +165,8 @@ def _calib_ok():
     ]), tail=0.25)
 
 
-def _chip(freq, dur, kind="pulse", duty=0.25, decay=2.0, sustain=0.75, vib_from=None):
-    """帯域制限したパルス波/三角波 (倍音を足して作るのでエイリアスが出ない)。
+def _chip(freq, dur, kind="pulse", duty=0.25, decay=2.0, sustain=0.75, vib_from=None, attack=0.003):
+    """帯域制限したパルス波/三角波/鋸波 (倍音を足して作るのでエイリアスが出ない)。
     vib_from 秒以降に軽いビブラートを掛ける。"""
     t = _t(dur)
     f = np.full(len(t), float(freq))
@@ -167,10 +178,12 @@ def _chip(freq, dur, kind="pulse", duty=0.25, decay=2.0, sustain=0.75, vib_from=
     for k in range(1, int(16000 / freq) + 1):
         if kind == "pulse":
             s += 2 / (k * np.pi) * np.sin(k * np.pi * duty) * np.cos(k * phase)
+        elif kind == "saw":  # 高域を少し丸めた鋸波 (ブラス風)
+            s += 2 / (k * np.pi) * (-1) ** (k + 1) * np.sin(k * phase) * np.exp(-k * freq / 5000)
         elif k % 2:  # 三角波
             s += 8 / np.pi ** 2 * (-1) ** ((k - 1) // 2) / k ** 2 * np.sin(k * phase)
     amp = sustain + (1 - sustain) * np.exp(-25 * t)  # 頭だけ少し強い
-    return _shape(s, t, 0.003, decay, release=0.015) * amp
+    return _shape(s, t, attack, decay, release=0.015) * amp
 
 
 def _reset():
@@ -195,6 +208,213 @@ def _reset():
     return _mix(parts)
 
 
+def _brass(freq, dur, decay=1.5, vib_from=None):
+    """デチューンした鋸波2本 + 1オクターブ上のパルス (リード)。"""
+    a = _chip(freq * 1.0035, dur, kind="saw", decay=decay, attack=0.015, vib_from=vib_from)
+    b = _chip(freq / 1.0035, dur, kind="saw", decay=decay, attack=0.015, vib_from=vib_from)
+    lead = _chip(freq * 2, dur, duty=0.25, decay=decay, vib_from=vib_from)
+    return 0.5 * (a + b) + 0.25 * lead
+
+
+def _snare(dur=0.05, decay=60.0, seed=0):
+    t = _t(dur)
+    noise = np.random.default_rng(seed).standard_normal(len(t))
+    return _shape(noise, t, 0.001, decay, release=0.005)
+
+
+def _hit100_fever():
+    """fever モードの大当たりファンファーレ (オリジナル)。約3.8秒。
+    キラキラ上昇 → ドラムロール → ブラスの勝利フレーズ → 長いキメ。"""
+    parts = []
+    # 1) キラキラの上昇グリッサンド: C メジャースケールで C5 → C8
+    scale = [0, 2, 4, 5, 7, 9, 11]
+    gl = [72 + 12 * (i // 7) + scale[i % 7] for i in range(22)]
+    for i, n in enumerate(gl):
+        parts.append((i * 0.03, (0.3 + 0.2 * i / len(gl)) * _chip(_note(n), 0.12, duty=0.5, decay=25)))
+    # 2) ドラムロール: だんだん速く・大きく (0.55〜1.3秒)
+    t, k = 0.55, 0
+    while t < 1.28:
+        prog = (t - 0.55) / 0.75
+        parts.append((t, (0.1 + 0.3 * prog) * _snare(seed=k)))
+        t += 0.06 - 0.03 * prog
+        k += 1
+    parts.append((0.55, 0.5 * _chip(_note(36), 0.75, kind="tri", decay=0.5, attack=0.4)))  # 下でうなるベース
+    # 3) ブラスの勝利フレーズ (BPM 160)
+    s16 = 60 / 160 / 4
+    t0 = 1.3
+    phrase = [(0, 2, 72), (2, 1, 72), (3, 1, 74), (4, 2, 76), (6, 2, 79),
+              (8, 3, 77), (11, 1, 76), (12, 2, 74), (14, 2, 79)]
+    for st, ln, n in phrase:
+        parts.append((t0 + st * s16, 0.6 * _brass(_note(n), ln * s16 * 0.92)))
+    for st, n in [(0, 48), (4, 48), (8, 53), (12, 55)]:  # ベース C C F G
+        for h in (0, 2):
+            parts.append((t0 + (st + h) * s16, 0.5 * _chip(_note(n), s16 * 1.8, kind="tri", decay=4)))
+    for st in range(0, 16, 2):  # 8分のスネア
+        parts.append((t0 + st * s16, (0.12 if st % 4 else 0.2) * _snare(seed=100 + st)))
+    # 4) キメ: C メジャー和音を伸ばしてビブラート、ドンと鳴らして減衰
+    t1 = t0 + 16 * s16
+    for n, g in [(72, 0.3), (76, 0.25), (79, 0.25), (84, 0.35)]:
+        parts.append((t1, g * _brass(_note(n), 0.85, decay=2.5, vib_from=0.2)))
+    parts.append((t1, 0.6 * _chip(_note(36), 0.85, kind="tri", decay=3.0)))
+    parts.append((t1, 0.5 * _sub(0.6, decay=6.0)))
+    parts.append((t1, 0.15 * _snare(0.2, decay=15, seed=999)))
+    rng = np.random.default_rng(5)
+    for i in range(8):  # 余韻のキラキラ
+        n = int(rng.choice([96, 100, 103, 108]))
+        parts.append((t1 + 0.05 + i * 0.11, 0.06 * _chip(_note(n), 0.1, duty=0.5, decay=30)))
+    return _reverb(_mix(parts), tail=0.15, mix=0.2)
+
+
+def _svf(x, fc, q, mode="band"):
+    """状態変数フィルター。fc は定数か各サンプルの配列。q 小さいほど共鳴が強い。"""
+    fc = np.broadcast_to(np.asarray(fc, dtype=float), x.shape)
+    f = 2 * np.sin(np.pi * np.minimum(fc, SR / 6) / SR)
+    low = band = 0.0
+    out = np.empty_like(x)
+    for i in range(len(x)):
+        low += f[i] * band
+        band += f[i] * (x[i] - low - q * band)
+        out[i] = band if mode == "band" else low
+    return out
+
+
+def _gong(f0, dur, decay=1.6):
+    """銅鑼: 不協和な倍音を少しずつ違う速さで減衰させ、頭にノイズの打撃。"""
+    t = _t(dur)
+    s = np.zeros(len(t))
+    for r, a, d in [(1.0, 1.0, 1.0), (1.47, 0.7, 1.3), (2.09, 0.6, 1.6), (2.56, 0.5, 2.0),
+                    (2.76, 0.45, 2.2), (3.42, 0.35, 2.8), (4.17, 0.25, 3.5), (5.2, 0.18, 4.5),
+                    (6.73, 0.12, 5.5), (8.31, 0.08, 7.0)]:
+        bloom = 1 + 0.004 * (1 - np.exp(-3 * t))  # 鳴った後に少しピッチが上がる
+        s += a * np.sin(2 * np.pi * f0 * r * t * bloom) * np.exp(-decay * d * t)
+    noise = np.random.default_rng(11).standard_normal(len(t))
+    s += 0.6 * _lowpass(noise, 0.3) * np.exp(-25 * t)
+    return _shape(s, t, 0.004, 0.0, release=0.1)
+
+
+def _taiko(gain=1.0, seed=0):
+    """和太鼓: ピッチが落ちる低いサイン + 短いこもったノイズ。"""
+    dur = 0.45
+    t = _t(dur)
+    f = 50 + 45 * np.exp(-25 * t)
+    body = np.sin(2 * np.pi * np.cumsum(f) / SR) * np.exp(-9 * t)
+    noise = _lowpass(np.random.default_rng(seed).standard_normal(len(t)), 0.15) * np.exp(-40 * t)
+    return gain * _shape(body + 0.8 * noise, t, 0.002, 0.0, release=0.05)
+
+
+def _roar(dur):
+    """龍の咆哮: 唸る鋸波 + 低域ノイズを、下がっていくフォルマント2本に通す。"""
+    t = _t(dur)
+    pitch = 95 * (0.6 ** (t / dur))
+    growl = 1 + 0.5 * np.sin(2 * np.pi * 27 * t)
+    phase = 2 * np.pi * np.cumsum(pitch) / SR
+    src = sum(np.sin(k * phase) / k for k in range(1, 60)) * growl
+    src += 0.8 * _lowpass(np.random.default_rng(3).standard_normal(len(t)), 0.2)
+    slide = 0.6 ** (t / dur)
+    out = _svf(src, 650 * slide, 0.25) + 0.7 * _svf(src, 1100 * slide, 0.3)
+    amp = np.clip(t / 0.25, 0, 1) * (0.5 + 0.5 * np.cos(np.pi * np.clip((t - dur + 0.35) / 0.35, 0, 1)))
+    return out * amp
+
+
+def _fue(freq, dur, decay=1.0, vib_from=0.08):
+    """笛: サイン + 少しの倍音 + 息のノイズ、ビブラート。"""
+    t = _t(dur)
+    f = freq * (1 + 0.01 * np.clip((t - vib_from) / 0.1, 0, 1) * np.sin(2 * np.pi * 6 * t))
+    ph = 2 * np.pi * np.cumsum(f) / SR
+    s = np.sin(ph) + 0.15 * np.sin(2 * ph) + 0.06 * np.sin(3 * ph)
+    breath = _svf(np.random.default_rng(int(freq)).standard_normal(len(t)), freq, 0.5)
+    s += 0.25 * breath * (0.4 + 0.6 * np.exp(-20 * t))
+    return _shape(s, t, 0.02, decay, release=0.03)
+
+
+def _bonus_start():
+    """ボーナス開始 (オリジナル)。約2.1秒 (BGM と重なるので短め)。
+    銅鑼 → 和太鼓の連打 + 龍の咆哮 → ヨナ抜き音階の笛の上昇 → 「×2」のキメ (ドン、ドーン)。"""
+    parts = [(0.0, 0.8 * _gong(131, 2.0))]
+    # 和太鼓: ドン・ドン・ドドドドン (だんだん強く)
+    hits = [0.3, 0.5, 0.7, 0.78, 0.86, 0.94]
+    for i, h in enumerate(hits):
+        parts.append((h, _taiko(0.5 + 0.4 * i / len(hits), seed=i)))
+    parts.append((0.35, 0.22 * _roar(0.75)))
+    # ヨナ抜き (C D E G A) の上昇: C5 D5 E5 G5 A5 C6 D6 E6
+    for i, n in enumerate([72, 74, 76, 79, 81, 84, 86, 88]):
+        last = i == 7
+        parts.append((1.0 + i * 0.05, 0.7 * _fue(_note(n), 0.25 if last else 0.065, decay=4.0 if last else 0.0)))
+    # キメ: 2発 (×2)。太鼓 + ブラスの C・G・C、2発目は伸ばす
+    for k, st in enumerate([1.45, 1.62]):
+        ln = 0.1 if k == 0 else 0.35
+        parts.append((st, 1.3 * _taiko(seed=50 + k)))
+        for n in (60, 67, 72):
+            parts.append((st, 0.4 * _brass(_note(n), ln, decay=3.5 if k else 0.0, vib_from=0.12 if k else None)))
+    return _reverb(_mix(parts), tail=0.12, mix=0.25)
+
+
+def _bonus_end():
+    """ボーナス終了: 炎が消えるような下降スイープ (フィルターノイズ + 音程) と鐘一打。"""
+    dur = 0.75
+    t = _t(dur)
+    noise = np.random.default_rng(21).standard_normal(len(t))
+    fc = 3500 * (150 / 3500) ** (t / dur)
+    hiss = _svf(_svf(noise, fc, 0.7, mode="low"), fc, 0.9, mode="low")  # 24dB/oct で高域を絞っていく
+    tone = np.sin(2 * np.pi * np.cumsum(1400 * (200 / 1400) ** (t / dur)) / SR)
+    amp = np.clip(t / 0.03, 0, 1) * np.exp(-2.5 * t)
+    sweep = _shape((0.6 * hiss + 0.3 * tone) * amp, t, 0.01, 0.0, release=0.1)
+    bell = _fm_bell(_note(67), 0.6, ratio=1.4, index=1.0, decay=5.0)  # G4
+    return _reverb(_mix([(0.0, sweep), (0.3, 0.45 * bell)]), tail=0.1, mix=0.25)
+
+
+def _kick():
+    t = _t(0.25)
+    f = 45 + 110 * np.exp(-30 * t)
+    return _shape(np.sin(2 * np.pi * np.cumsum(f) / SR), t, 0.001, 14.0, release=0.03)
+
+
+def _hat(seed, decay=70.0):
+    t = _t(0.05)
+    n = np.random.default_rng(seed).standard_normal(len(t) + 2)
+    return _shape(np.diff(n, 2) / 4, t, 0.0005, decay, release=0.005)  # 2回差分で高域だけ
+
+
+def _bonus_bgm():
+    """ボーナス中の BGM (曲ファイルがないときの代わり、オリジナル)。
+    BPM 128、12拍 (約5.6秒)。コードは 2拍ずつ I-V-vi-IV-I-V (C G Am F C G)。"""
+    beat = 60 / 128
+    e8 = beat / 2
+    nbeat = 12
+    total = nbeat * beat
+    parts = []
+    # キック (4つ打ち)・クラップ (2・4拍)・ハイハット (裏の8分)
+    for b in range(nbeat):
+        parts.append((b * beat, 0.65 * _kick()))
+        if b % 2:
+            parts.append((b * beat, 0.3 * _lowpass(_snare(0.12, decay=30, seed=b), 0.5)))
+        parts.append((b * beat + e8, 0.12 * _hat(b)))
+        parts.append((b * beat, 0.05 * _hat(100 + b, decay=120)))
+    chords = [(48, [64, 67, 72]), (43, [62, 67, 71]), (45, [64, 69, 72]),
+              (41, [65, 69, 72]), (48, [64, 67, 72]), (43, [62, 67, 71])]
+    for c, (root, tones) in enumerate(chords):
+        st = c * 2 * beat
+        # ベース: 8分で root とオクターブ上を行き来
+        for i in range(4):
+            n = root if i % 2 == 0 else root + 12
+            parts.append((st + i * e8, 0.35 * _chip(_note(n), e8 * 0.8, duty=0.5, decay=6)))
+        # コード: 鋸波を裏拍で刻む
+        for i in range(4):
+            for n in tones:
+                parts.append((st + i * e8 + e8 / 2 * (i % 2), 0.09 * _chip(_note(n), e8 * 0.55, kind="saw", decay=5)))
+    # リード (矩形波 25%): (開始8分, 長さ8分, MIDI)
+    lead = [(0, 1, 76), (1, 1, 79), (2, 1, 84), (3, 1, 79),
+            (4, 2, 83), (6, 1, 81), (7, 1, 79),
+            (8, 1, 76), (9, 1, 79), (10, 2, 81),
+            (12, 1, 77), (13, 1, 76), (14, 2, 72),
+            (16, 1, 76), (17, 1, 79), (18, 1, 84), (19, 1, 86),
+            (20, 2, 86), (22, 2, 83)]
+    for st, ln, n in lead:
+        parts.append((st * e8, 0.25 * _chip(_note(n), ln * e8 * 0.85, duty=0.25, decay=2.0, vib_from=0.12)))
+    buf = _mix(parts)[: int(SR * total)]
+    return np.concatenate([buf, np.zeros(int(SR * total) - len(buf))])
+
+
 def _finish(x, fade_in=0.002, fade_out=0.03):
     """DC 除去 → 端のフェード → ピーク -3dBFS に正規化 → int16。"""
     x = np.asarray(x, dtype=float)
@@ -213,6 +433,8 @@ def synth(name):
     raw = {
         "hit10": _hit10, "hit50": _hit50, "hit100": _hit100,
         "calib_start": _calib_start, "calib_ok": _calib_ok, "reset": _reset,
+        "hit100_fever": _hit100_fever, "bonus_start": _bonus_start, "bonus_end": _bonus_end,
+        "bonus_bgm": _bonus_bgm,
     }[name]()
     return _finish(raw)
 
@@ -237,7 +459,15 @@ def _default_dirs():
 
 def _write_all(d):
     os.makedirs(d, exist_ok=True)
-    paths = {}
+    paths = {name: os.path.join(d, name + ".wav") for name in NAMES}
+    stamp = os.path.join(d, "VERSION")
+    try:
+        with open(stamp) as f:
+            cached = f.read().strip() == SOUND_VERSION
+    except OSError:
+        cached = False
+    if cached and all(os.path.isfile(p) for p in paths.values()):
+        return paths
     for name in NAMES:
         p = os.path.join(d, name + ".wav")
         data = _wav_bytes(synth(name))
@@ -249,7 +479,8 @@ def _write_all(d):
         if not same:
             with open(p, "wb") as f:
                 f.write(data)
-        paths[name] = p
+    with open(stamp, "w") as f:
+        f.write(SOUND_VERSION)
     return paths
 
 
@@ -330,3 +561,147 @@ def play_sound(score):
     name = _SCORE_NAMES.get(score)
     if name:
         play(name)
+
+
+# ---- BGM ------------------------------------------------------------------
+
+BGM_EXTS = (".mp3", ".wav")
+BGM_VOLUME = 0.6  # 効果音より少し小さく (0〜1)
+BGM_FADE_SEC = 0.4
+
+_bgm_queue = queue.Queue()
+_bgm_worker = None
+_bgm_proc = None
+_bgm_mci_open = False
+
+
+def bgm_dir():
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bgm")
+
+
+def find_bgm_file(directory=None):
+    """directory (既定: <repo>/bgm) にある最初の .mp3/.wav (名前順)。なければ None。"""
+    d = directory or bgm_dir()
+    try:
+        names = sorted(n for n in os.listdir(d) if n.lower().endswith(BGM_EXTS))
+    except OSError:
+        return None
+    for n in names:
+        p = os.path.join(d, n)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _bgm_start_sec():
+    try:
+        from . import config
+        return float(getattr(config, "BGM_START_SEC", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def resolve_bgm(directory=None, start_sec=None):
+    """(path, start_sec) を返す。曲ファイルがなければ合成 BGM (開始 0 秒)。"""
+    p = find_bgm_file(directory)
+    if p:
+        return p, _bgm_start_sec() if start_sec is None else float(start_sec)
+    if not _paths:
+        init()
+    return _paths.get("bonus_bgm"), 0.0
+
+
+def _bgm_linux_cmd(path, start_sec):
+    """Linux 用の再生コマンド。使えるものがなければ None。"""
+    ffplay = shutil.which("ffplay")
+    if ffplay:
+        return [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
+                "-volume", str(int(100 * BGM_VOLUME)), "-ss", f"{start_sec:.3f}", path]
+    paplay = shutil.which("paplay")
+    if paplay and path.lower().endswith(".wav"):  # paplay は mp3 も途中開始も不可
+        return [paplay, f"--volume={int(65536 * BGM_VOLUME)}", path]
+    return None
+
+
+def _mci(cmd):
+    import ctypes
+    buf = ctypes.create_unicode_buffer(256)
+    err = ctypes.windll.winmm.mciSendStringW(cmd, buf, 255, 0)
+    return err, buf.value
+
+
+def _bgm_play(path, start_sec):
+    global _bgm_proc, _bgm_mci_open
+    _bgm_halt(fade=False)
+    if not path:
+        return
+    if platform.system() == "Windows":
+        if _mci(f'open "{path}" type mpegvideo alias bgm')[0]:
+            return
+        _bgm_mci_open = True
+        _mci("set bgm time format milliseconds")
+        _mci(f"setaudio bgm volume to {int(1000 * BGM_VOLUME)}")
+        _mci(f"play bgm from {int(1000 * start_sec)}")
+    else:
+        cmd = _bgm_linux_cmd(path, start_sec)
+        if cmd:
+            _bgm_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+
+
+def _bgm_halt(fade=True):
+    """BGM を止める。MCI なら音量を段階的に下げてから止める。Linux は即停止。"""
+    global _bgm_proc, _bgm_mci_open
+    if _bgm_mci_open:
+        if fade:
+            steps = 8
+            for i in range(steps, 0, -1):
+                if not _bgm_queue.empty():  # 次の指示が来たらフェードを切り上げる
+                    break
+                _mci(f"setaudio bgm volume to {int(1000 * BGM_VOLUME * (i - 1) / steps)}")
+                time.sleep(BGM_FADE_SEC / steps)
+        _mci("stop bgm")
+        _mci("close bgm")
+        _bgm_mci_open = False
+    if _bgm_proc is not None:
+        if _bgm_proc.poll() is None:
+            _bgm_proc.terminate()
+            try:
+                _bgm_proc.wait(timeout=1)
+            except Exception:
+                _bgm_proc.kill()
+        _bgm_proc = None
+
+
+def _bgm_run():
+    while True:
+        cmd = _bgm_queue.get()
+        try:
+            if cmd == "stop":
+                _bgm_halt(fade=True)
+            else:
+                _bgm_play(*resolve_bgm())
+        except Exception:
+            pass
+
+
+def _bgm_send(cmd):
+    global _bgm_worker
+    try:
+        with _lock:
+            if _bgm_worker is None or not _bgm_worker.is_alive():
+                _bgm_worker = threading.Thread(target=_bgm_run, name="bgm", daemon=True)
+                _bgm_worker.start()
+        _bgm_queue.put_nowait(cmd)
+    except Exception:
+        pass
+
+
+def bgm_start():
+    """BGM を流し始める。すぐ返る。鳴っていれば頭から流し直す。"""
+    _bgm_send("start")
+
+
+def bgm_stop():
+    """BGM をフェードアウトして止める (Linux は即停止)。すぐ返る。"""
+    _bgm_send("stop")

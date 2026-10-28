@@ -13,7 +13,7 @@ from .game import COOLDOWN, GameState
 from .keys import decode_key
 from .render_monitor import BUTTONS, render_monitor
 from .render_projector import render_projector
-from .settings import load_offset, save_offset
+from .settings import MODES, load_mode, load_offset, save_mode, save_offset
 from . import sound
 
 WIN_CAM = "Camera Monitor (Control)"
@@ -26,6 +26,16 @@ OFS_IDLE, OFS_WAIT_SHOT, OFS_WAIT_CLICK = 0, 1, 2
 _NUDGE = {"up": (0, -1), "w": (0, -1), "down": (0, 1), "s": (0, 1),
           "left": (-1, 0), "a": (-1, 0), "right": (1, 0), "d": (1, 0)}
 _OFFSET_KEYS = {"i": (0, -1), "k": (0, 1), "j": (-1, 0), "l": (1, 0)}
+
+
+def _bgm(name):
+    """sound.bgm_start / bgm_stop を呼ぶ。無い版の sound なら何もしない。"""
+    fn = getattr(sound, name, None)
+    if callable(fn):
+        try:
+            fn()
+        except Exception:
+            pass
 
 
 def _in_rect(x, y, rect):
@@ -43,6 +53,7 @@ class App:
         self.corners = load_corners(corners_path)
         self.settings_path = settings_path
         self.hit_offset = load_offset(settings_path)
+        self.mode = load_mode(settings_path)  # 演出モード "normal" / "fever"
         self.tracker = HitTracker()
         self.last_settled = None  # 直近の確定結果 (監視画面の表示用)
         self.offset_step = OFS_IDLE
@@ -61,7 +72,10 @@ class App:
     # ------------------------------------------------------------ 操作
     def reset_game(self, quiet=False):
         """スコアと背景をリセット。quiet=True は角の設定変更に伴うリセット (音なし)。"""
+        had_bonus = self.game.bonus_until is not None
         self.game.reset()
+        if had_bonus:
+            _bgm("bgm_stop")
         self.bg_gray = None
         self.tracker.reset()
         if not quiet:
@@ -87,6 +101,17 @@ class App:
         self.hit_offset = (int(dx), int(dy))
         save_offset(self.hit_offset, self.settings_path)
         print(f"★ 着弾補正 HIT_OFFSET = {self.hit_offset}")
+
+    def toggle_mode(self):
+        self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
+        save_mode(self.mode, self.settings_path)
+        print(f"★ 演出モード: {self.mode}")
+        if self.mode != "fever":
+            self.game.bull_streak = 0
+            if self.game.end_bonus():
+                _bgm("bgm_stop")
+                sound.play("bonus_end")
+                print("★ ボーナスタイム終了 (normal に切替)")
 
     def toggle_offset_mode(self):
         if self.offset_step == OFS_IDLE:
@@ -184,6 +209,8 @@ class App:
                             self.hit_offset[1] + dy * config.OFFSET_STEP_PX)
         elif k == "o":
             self.toggle_offset_mode()
+        elif k == "p":
+            self.toggle_mode()
         elif k == "f":
             self.toggle_fullscreen()
         return True
@@ -201,9 +228,16 @@ class App:
         score = score_for_point(x, y)
         if score <= 0:
             return 0
-        self.game.register_hit(x, y, score, now)
-        print(f"★ ナーフ弾命中! 座標:({x}, {y}) -> +{score}点 (合計: {self.game.total_score})")
-        sound.play(f"hit{score}")
+        mult, event = self.game.register_hit(x, y, score, now, fever=self.mode == "fever")
+        bonus = f" x{mult} (ボーナス残り {self.game.bonus_left(now):.1f}秒)" if mult > 1 else ""
+        print(f"★ ナーフ弾命中! 座標:({x}, {y}) -> +{score * mult}点{bonus} (合計: {self.game.total_score})")
+        sound.play("hit100_fever" if score == 100 and self.mode == "fever" else f"hit{score}")
+        if event == "start":
+            sound.play("bonus_start")
+            _bgm("bgm_start")
+            print(f"★ ボーナスタイム開始! {config.BONUS_SEC:.0f}秒間スコア2倍")
+        elif event == "extend":  # BGM は止めずに流し続ける
+            print(f"★ ボーナスタイム延長! 残り {self.game.bonus_left(now):.1f}秒")
         return score
 
     def _on_settled(self, settled, now):
@@ -248,6 +282,11 @@ class App:
             except Exception:
                 warped_bgr = warped_gray = None
 
+        if self.game.update_bonus(now):
+            _bgm("bgm_stop")
+            sound.play("bonus_end")
+            print("★ ボーナスタイム終了")
+
         dart_mask = None
         if self.calib_step == CALIB_IDLE:
             if self.game.phase == COOLDOWN:
@@ -264,16 +303,30 @@ class App:
                 except Exception as e:
                     print("Hit error:", e)
 
-        proj = render_projector(config.PROJ_W, config.PROJ_H, config.TARGET_CENTER, config.RADII,
-                                self.game.total_score, self.game.hits,
-                                self.game.cooldown_progress(now),
-                                self.calib_step == CALIB_FLASH, now)
+        args = (config.PROJ_W, config.PROJ_H, config.TARGET_CENTER, config.RADII,
+                self.game.total_score, self.game.hits, self.game.cooldown_progress(now),
+                self.calib_step == CALIB_FLASH, now)
+        proj = _call_projector(args, mode=self.mode, bonus_start=self.game.bonus_start,
+                               bonus_until=self.game.bonus_until)
         monitor = render_monitor(cam_frame, self.corners, self.selected, self.click_step,
                                  warped_bgr, dart_mask, config.CORNER_LABELS, config.CORNER_COLORS,
                                  settled=self.last_settled,
                                  tracking_frames=self.tracker.seen,
-                                 offset=self.hit_offset, offset_step=self.offset_step)
+                                 offset=self.hit_offset, offset_step=self.offset_step,
+                                 mode=self.mode, bonus_left=self.game.bonus_left(now))
         return proj, monitor
+
+
+def _call_projector(args, **kw):
+    """新しい引数を受け取れない版の render_projector でも落ちないよう、後ろから外して呼び直す。"""
+    keys = list(kw)
+    while True:
+        try:
+            return render_projector(*args, **{k: kw[k] for k in keys})
+        except TypeError:
+            if not keys:
+                raise
+            keys.pop()
 
 
 # ---------------------------------------------------------------- 起動
@@ -324,6 +377,7 @@ def print_help(demo):
     print(" [F]              : 投影画面の全画面切替")
     print(" [I][K] / [J][L]  : 着弾補正を上下 / 左右に2pxずつ (settings.json に保存)")
     print(" [O]              : 着弾補正モード (1発撃って投影画面で実際の位置をクリック)")
+    print(" [P]              : 演出モード切替 (normal / fever)")
     print(" [ESC] / [Q]      : 終了")
     print("=========================================================")
 
@@ -363,6 +417,7 @@ def run(demo=False):
             if not app.handle_key(cv2.waitKeyEx(1)):
                 break
     finally:
+        _bgm("bgm_stop")
         if cap is not None:
             cap.release()
         cv2.destroyAllWindows()

@@ -30,9 +30,13 @@ python nerf_target.py --demo   # カメラなし。投影画面をクリック�
 | `F` | 投影画面の全画面切り替え |
 | `I` `K` / `J` `L` | 着弾補正 (`HIT_OFFSET`) を上下 / 左右に2pxずつ |
 | `O` | 着弾補正モード (もう一度押すと中止) |
+| `P` | 演出モード切り替え (`normal` / `fever`: ブル命中がパチンコ並みに派手) |
+
+fever ではブルを2連続で当てると5秒間スコア2倍のボーナスタイム (中にまた2連続で延長、`R` か normal 切替で終了)。
+ボーナス中の BGM は `bgm/` に mp3/wav を置くと流れる (なければ内蔵のループ)。
 | `ESC` / `Q` | 終了 |
 
-四隅の設定は `corners.json`、着弾補正は `settings.json` に保存され、次回起動時に読み込まれる。
+四隅の設定は `corners.json`、着弾補正と演出モードは `settings.json` に保存され、次回起動時に読み込まれる。
 
 着弾補正 (判定が実際の着弾とずれるとき):
 
@@ -48,7 +52,7 @@ syateki/
   config.py             定数 (検出のしきい値・的の半径など)
   calibration.py        四隅の並べ替え・フラッシュ検出・corners.json
   detector.py           着弾検出・止まるまでの追跡・スコア判定
-  settings.py           settings.json (着弾補正) の読み書き
+  settings.py           settings.json (着弾補正・演出モード) の読み書き
   game.py               スコア・履歴・READY/COOLDOWN
   render_projector.py   投影画面の描画
   render_monitor.py     監視画面の描画

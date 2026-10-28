@@ -194,7 +194,8 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
                    dart_mask: np.ndarray | None,
                    corner_labels: list[str], corner_colors: list[tuple],
                    settled=None, tracking_frames: int = 0,
-                   offset: tuple[int, int] = (0, 0), offset_step: int = 0) -> np.ndarray:
+                   offset: tuple[int, int] = (0, 0), offset_step: int = 0,
+                   mode: str = "normal", bonus_left: float = 0.0) -> np.ndarray:
     """カメラ監視画面を描画した BGR 画像を返す（入力は書き換えない）
 
     click_step: -1 なら通常表示。0〜3 なら「次に [n] をクリック」ガイドを表示
@@ -202,6 +203,8 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
     tracking_frames: 着弾候補を追跡中のフレーム数 (0 = 追跡していない)
     offset: 現在の HIT_OFFSET。ガイド帯に出す
     offset_step: 1 = 補正モードで着弾待ち、2 = 投影画面のクリック待ち
+    mode: 演出モード ("normal" / "fever")。ガイド帯に出す
+    bonus_left: ボーナスタイム (スコア2倍) の残り秒。0 より大きければガイド帯に出す
     """
     img = cv2.cvtColor(cam_frame, cv2.COLOR_GRAY2BGR) if cam_frame.ndim == 2 else cam_frame.copy()
     h, w = img.shape[:2]
@@ -254,7 +257,9 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
         c1, c2 = GUIDE_HI, (255, 255, 255)
     else:
         lab = corner_labels[selected_idx % len(corner_labels)] if corner_labels else ""
-        line1 = "C: AUTO ALIGN / M: CLICK 4 / R: RESET / F: FULLSCREEN"
+        line1 = f"C: AUTO ALIGN / M: CLICK 4 / R: RESET / F: FULLSCREEN / P: {mode.upper()}"
+        if bonus_left > 0:
+            line1 = f"BONUS x2 {bonus_left:.1f}s / " + line1
         line2 = f"Drag corner / Arrows,WASD: fine-tune {lab} / {ofs} (IJKL, O: auto)"
         c1, c2 = (230, 255, 60), (210, 210, 210)
     max_w = w - 2 * m

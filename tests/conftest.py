@@ -11,3 +11,5 @@ def _silence(monkeypatch):
     """テスト中は音を鳴らさない (WAV の書き出しもしない)。"""
     from syateki import sound
     monkeypatch.setattr(sound, "play", lambda name: None)
+    monkeypatch.setattr(sound, "bgm_start", lambda: None, raising=False)
+    monkeypatch.setattr(sound, "bgm_stop", lambda: None, raising=False)

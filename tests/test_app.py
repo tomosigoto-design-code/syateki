@@ -265,3 +265,178 @@ def test_auto_calibration_flow(tmp_path):
     for (fx, fy), (qx, qy) in zip(app.corners, quad):
         assert abs(fx - qx) <= 6 and abs(fy - qy) <= 6
     assert json.loads(p.read_text()) == app.corners
+
+
+# ---------------------------------------------------------------- 演出モード
+def test_mode_toggle_saves_and_reloads(tmp_path):
+    app, _ = make_app(tmp_path)
+    assert app.mode == "normal"
+    app.set_offset(2, 4)
+    assert app.handle_key(ord("p")) and app.mode == "fever"
+    data = json.loads((tmp_path / "settings.json").read_text())
+    assert data == {"hit_offset": [2, 4], "mode": "fever"}  # オフセットは消えない
+    app2, _ = make_app(tmp_path)
+    assert app2.mode == "fever" and app2.hit_offset == (2, 4)
+    assert app2.handle_key(ord("P")) and app2.mode == "normal"
+    assert make_app(tmp_path)[0].mode == "normal"
+
+
+def test_mode_load_invalid_falls_back(tmp_path):
+    from syateki.settings import load_mode
+    p = tmp_path / "settings.json"
+    assert load_mode(str(p)) == "normal"
+    p.write_text(json.dumps({"mode": "party"}))
+    assert load_mode(str(p)) == "normal"
+    p.write_text("[1, 2]")
+    assert load_mode(str(p)) == "normal"
+
+
+@pytest.mark.parametrize("mode,x_off,expect", [
+    ("normal", 0, "hit100"), ("fever", 0, "hit100_fever"),
+    ("fever", 100, "hit50"), ("normal", 100, "hit50"),
+])
+def test_hit_sound_by_mode(tmp_path, monkeypatch, mode, x_off, expect):
+    from syateki import sound
+    played = []
+    monkeypatch.setattr(sound, "play", played.append)
+    app, _ = make_app(tmp_path, demo=True)
+    app.mode = mode
+    cx, cy = config.TARGET_CENTER
+    app.on_proj_mouse(cv2.EVENT_LBUTTONDOWN, cx + x_off, cy, 0, now=1.0)
+    assert played == [expect]
+
+
+def test_projector_receives_mode(tmp_path, monkeypatch):
+    from syateki import app as app_mod
+    calls = []
+
+    def fake(*args, **kw):
+        calls.append(kw.get("mode"))
+        return np.zeros((H, W, 3), np.uint8)
+    monkeypatch.setattr(app_mod, "render_projector", fake)
+    app, _ = make_app(tmp_path)
+    app.handle_key(ord("p"))
+    app.step(bg_frame(), 0.0)
+    assert calls == ["fever"]
+
+
+def test_projector_without_mode_kwarg_falls_back(tmp_path, monkeypatch):
+    from syateki import app as app_mod
+
+    def old(w, h, center, radii, total, hits, cd, calibrating, now):  # mode を受け取れない版
+        return np.zeros((h, w, 3), np.uint8)
+    monkeypatch.setattr(app_mod, "render_projector", old)
+    app, _ = make_app(tmp_path)
+    proj, _ = app.step(bg_frame(), 0.0)
+    assert proj.shape == (H, W, 3)
+
+
+# ---------------------------------------------------------------- ボーナスタイム
+def _shoot(app, x, y, now):
+    app.on_proj_mouse(cv2.EVENT_LBUTTONDOWN, x, y, 0, now=now)
+    app.game.update(now + config.COOLDOWN_SEC)
+
+
+def test_bonus_sounds_and_mode_switch(tmp_path, monkeypatch):
+    from syateki import sound
+    played = []
+    monkeypatch.setattr(sound, "play", played.append)
+    app, _ = make_app(tmp_path, demo=True)
+    app.handle_key(ord("p"))
+    cx, cy = config.TARGET_CENTER
+    _shoot(app, cx, cy, 1.0)
+    _shoot(app, cx, cy, 3.0)
+    assert played == ["hit100_fever", "hit100_fever", "bonus_start"]
+    _shoot(app, cx + 100, cy, 5.0)                # ボーナス中: 50 x2、音は通常どおり
+    assert app.game.total_score == 300 and played[-1] == "hit50"
+    app.handle_key(ord("p"))                      # normal に切替 → 即終了
+    assert app.game.bonus_until is None and played[-1] == "bonus_end"
+
+
+def test_bonus_ends_in_step_and_reset(tmp_path, monkeypatch):
+    from syateki import sound
+    played = []
+    monkeypatch.setattr(sound, "play", played.append)
+    app, _ = make_app(tmp_path, demo=True)
+    app.mode = "fever"
+    cx, cy = config.TARGET_CENTER
+    _shoot(app, cx, cy, 1.0), _shoot(app, cx, cy, 3.0)
+    _, mon = app.step(bg_frame(), 4.0)            # 監視画面にボーナス表示 (落ちない)
+    assert app.game.bonus_active(4.0)
+    app.step(bg_frame(), 3.0 + config.BONUS_SEC)
+    assert app.game.bonus_until is None and played[-1] == "bonus_end"
+    _shoot(app, cx, cy, 20.0), _shoot(app, cx, cy, 22.0)
+    app.handle_key(ord("r"))                      # リセットで解除
+    assert app.game.bonus_until is None and app.game.total_score == 0
+
+
+def test_projector_receives_bonus(tmp_path, monkeypatch):
+    from syateki import app as app_mod
+    calls = []
+
+    def fake(*args, **kw):
+        calls.append(kw)
+        return np.zeros((H, W, 3), np.uint8)
+    monkeypatch.setattr(app_mod, "render_projector", fake)
+    app, _ = make_app(tmp_path, demo=True)
+    app.mode = "fever"
+    cx, cy = config.TARGET_CENTER
+    _shoot(app, cx, cy, 1.0), _shoot(app, cx, cy, 3.0)
+    app.step(bg_frame(), 4.0)
+    assert calls[-1] == {"mode": "fever", "bonus_start": 3.0, "bonus_until": 3.0 + config.BONUS_SEC}
+
+
+def test_projector_with_mode_only_falls_back(tmp_path, monkeypatch):
+    from syateki import app as app_mod
+    seen = []
+
+    def mid(w, h, center, radii, total, hits, cd, calibrating, now, mode="normal"):
+        seen.append(mode)
+        return np.zeros((h, w, 3), np.uint8)
+    monkeypatch.setattr(app_mod, "render_projector", mid)
+    app, _ = make_app(tmp_path)
+    app.mode = "fever"
+    proj, _ = app.step(bg_frame(), 0.0)
+    assert proj.shape == (H, W, 3) and seen == ["fever"]
+
+
+def test_bgm_calls(tmp_path, monkeypatch):
+    """BGM: 発動で start、延長では止めない、終了・リセット・normal 切替・終了処理で stop。"""
+    from syateki import sound
+    calls = []
+    monkeypatch.setattr(sound, "bgm_start", lambda: calls.append("start"), raising=False)
+    monkeypatch.setattr(sound, "bgm_stop", lambda: calls.append("stop"), raising=False)
+    app, _ = make_app(tmp_path, demo=True)
+    app.mode = "fever"
+    cx, cy = config.TARGET_CENTER
+    _shoot(app, cx, cy, 1.0), _shoot(app, cx, cy, 2.5)       # 発動 (〜7.5)
+    assert calls == ["start"]
+    _shoot(app, cx, cy, 4.0), _shoot(app, cx, cy, 5.5)       # 延長 (〜10.5)
+    assert calls == ["start"] and app.game.bonus_until == 5.5 + config.BONUS_SEC
+    app.step(bg_frame(), 8.0)
+    assert calls == ["start"]                                # 延長前の終了時刻では止まらない
+    app.step(bg_frame(), 5.5 + config.BONUS_SEC)             # 時間切れ
+    assert calls == ["start", "stop"]
+
+    _shoot(app, cx, cy, 20.0), _shoot(app, cx, cy, 21.5)
+    app.handle_key(ord("r"))                                 # リセット
+    assert calls[-2:] == ["start", "stop"]
+    app.handle_key(ord("r"))                                 # ボーナスなしのリセットでは呼ばない
+    assert len(calls) == 4
+
+    _shoot(app, cx, cy, 30.0), _shoot(app, cx, cy, 31.5)
+    app.handle_key(ord("p"))                                 # normal へ切替
+    assert app.mode == "normal" and calls[-2:] == ["start", "stop"] and len(calls) == 6
+
+
+def test_bgm_missing_in_sound_is_ignored(tmp_path, monkeypatch):
+    from syateki import sound
+    monkeypatch.delattr(sound, "bgm_start", raising=False)
+    monkeypatch.delattr(sound, "bgm_stop", raising=False)
+    app, _ = make_app(tmp_path, demo=True)
+    app.mode = "fever"
+    cx, cy = config.TARGET_CENTER
+    _shoot(app, cx, cy, 1.0), _shoot(app, cx, cy, 2.5)
+    assert app.game.bonus_active(3.0)
+    app.step(bg_frame(), 2.5 + config.BONUS_SEC)
+    assert app.game.bonus_until is None

@@ -58,6 +58,7 @@ CALIB_MIN_AREA = 8000
 FLASH_WAIT_SEC = 0.25    # 白点灯後、カメラ露出が安定するまで待つ
 
 COOLDOWN_SEC = 1.2       # 命中後、次の検出までの時間
+BONUS_SEC = 5.0          # fever でブル2連続 → この秒数スコア2倍 (BGM が流れる)
 
 # 的
 TARGET_CENTER = (PROJ_W // 2, PROJ_H // 2)
@@ -67,3 +68,6 @@ R10 = 260
 RADII = (R100, R50, R10)
 
 NUDGE_PX = 2  # 矢印キー / WASD で角を動かす量
+
+# ボーナス中BGMの再生開始位置(秒)。サビ頭から流すときに指定
+BGM_START_SEC = 0
