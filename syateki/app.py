@@ -1,0 +1,310 @@
+"""メインループと入力処理。"""
+import argparse
+import platform
+import time
+
+import cv2
+import numpy as np
+
+from . import config
+from .calibration import detect_projection_corners, load_corners, save_corners
+from .detector import detect_hit, score_for_point, warp_to_projector
+from .game import COOLDOWN, GameState
+from .keys import decode_key
+from .render_monitor import BUTTONS, render_monitor
+from .render_projector import render_projector
+from . import sound
+
+WIN_CAM = "Camera Monitor (Control)"
+WIN_PROJ = "Projector View (Target)"
+
+CALIB_IDLE, CALIB_DARK, CALIB_FLASH = 0, 1, 2
+
+_NUDGE = {"up": (0, -1), "w": (0, -1), "down": (0, 1), "s": (0, 1),
+          "left": (-1, 0), "a": (-1, 0), "right": (1, 0), "d": (1, 0)}
+
+
+def _in_rect(x, y, rect):
+    x1, y1, x2, y2 = rect
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+class App:
+    """状態をすべて持つ。step() はウィンドウを使わないのでテストから呼べる。"""
+
+    def __init__(self, demo=False, corners_path=config.CONFIG_FILE):
+        self.demo = demo
+        self.corners_path = corners_path
+        self.corners = load_corners(corners_path)
+        self.selected = 0
+        self.click_step = -1      # 0〜3: 4点クリック設定中
+        self.dragging = False
+        self.calib_step = CALIB_IDLE
+        self.calib_start = 0.0
+        self.dark_gray = None
+        self.bg_gray = None
+        self.game = GameState()
+        self.fullscreen = False
+        self.running = True
+
+    # ------------------------------------------------------------ 操作
+    def reset_game(self, quiet=False):
+        """スコアと背景をリセット。quiet=True は角の設定変更に伴うリセット (音なし)。"""
+        self.game.reset()
+        self.bg_gray = None
+        if not quiet:
+            sound.play("reset")
+        print("★ スコアと背景をリセットしました！")
+
+    def start_auto_calibration(self, now=None):
+        self.click_step = -1
+        self.calib_step = CALIB_DARK
+        self.calib_start = time.time() if now is None else now
+        self.dark_gray = None
+        sound.play("calib_start")
+        print("★ 四隅の自動認識キャリブレーションを開始します (プロジェクターが一瞬光ります)")
+
+    def start_click_mode(self):
+        self.click_step = 0
+        print("★ 4点クリック設定モード開始: カメラ画面の [1]左上 をクリックしてください")
+
+    def save(self):
+        save_corners(self.corners, self.corners_path)
+
+    def on_camera_mouse(self, event, x, y, flags, param=None):
+        if event == cv2.EVENT_RBUTTONDOWN:
+            self.reset_game()
+            return
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if _in_rect(x, y, BUTTONS["reset"]):
+                self.reset_game()
+                return
+            if _in_rect(x, y, BUTTONS["auto"]):
+                self.start_auto_calibration()
+                return
+            if _in_rect(x, y, BUTTONS["click4"]):
+                self.start_click_mode()
+                return
+            if self.click_step >= 0:
+                self.corners[self.click_step] = [x, y]
+                print(f"★ {config.CORNER_LABELS[self.click_step]} を設定: ({x}, {y})")
+                self.click_step += 1
+                if self.click_step >= 4:
+                    self.click_step = -1
+                    self.save()
+                    self.reset_game(quiet=True)
+                    sound.play("calib_ok")
+                    print("★ 4つの角の手動設定が完了しました！")
+                return
+            # 最も近い角をクリック位置へ動かす (保存は離したとき)
+            d = [np.hypot(x - p[0], y - p[1]) for p in self.corners]
+            self.selected = int(np.argmin(d))
+            self.corners[self.selected] = [x, y]
+            self.dragging = True
+        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON) and self.dragging:
+            self.corners[self.selected] = [x, y]
+        elif event == cv2.EVENT_LBUTTONUP and self.dragging:
+            self.dragging = False
+            self.save()
+            self.reset_game(quiet=True)
+
+    def on_proj_mouse(self, event, x, y, flags, param=None, now=None):
+        if event == cv2.EVENT_RBUTTONDOWN:
+            self.reset_game()
+        elif event == cv2.EVENT_LBUTTONDOWN and self.demo:
+            # デモ: クリック位置を着弾として扱う
+            if self.calib_step == CALIB_IDLE and self.game.ready:
+                self._register(x, y, time.time() if now is None else now)
+
+    def handle_key(self, code):
+        """キー1つを処理する。終了なら False。"""
+        k = decode_key(code)
+        if k is None:
+            return True
+        if k in ("esc", "q"):
+            return False
+        if k == "c":
+            self.start_auto_calibration()
+        elif k == "m":
+            self.start_click_mode()
+        elif k == "r":
+            self.reset_game()
+        elif k == "tab":
+            self.selected = (self.selected + 1) % 4
+            print(f"★ 選択中の角: {config.CORNER_LABELS[self.selected]}")
+        elif k in _NUDGE:
+            dx, dy = _NUDGE[k]
+            p = self.corners[self.selected]
+            p[0] += dx * config.NUDGE_PX
+            p[1] += dy * config.NUDGE_PX
+            self.save()
+            self.bg_gray = None  # 変換が変わるので背景を撮り直す
+        elif k == "f":
+            self.toggle_fullscreen()
+        return True
+
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        try:
+            cv2.setWindowProperty(WIN_PROJ, cv2.WND_PROP_FULLSCREEN,
+                                  cv2.WINDOW_FULLSCREEN if self.fullscreen else cv2.WINDOW_NORMAL)
+        except cv2.error:
+            pass
+
+    # ------------------------------------------------------------ 1フレーム
+    def _register(self, x, y, now):
+        score = score_for_point(x, y)
+        if score <= 0:
+            return 0
+        self.game.register_hit(x, y, score, now)
+        print(f"★ ナーフ弾命中! 座標:({x}, {y}) -> +{score}点 (合計: {self.game.total_score})")
+        sound.play(f"hit{score}")
+        return score
+
+    def _calibration_step(self, cam_gray, now):
+        if self.calib_step == CALIB_DARK:
+            self.dark_gray = cam_gray.copy()
+            self.calib_step = CALIB_FLASH
+            self.calib_start = now
+        elif self.calib_step == CALIB_FLASH and now - self.calib_start > config.FLASH_WAIT_SEC:
+            found = detect_projection_corners(self.dark_gray, cam_gray)
+            if found is not None:
+                self.corners = found
+                self.save()
+                sound.play("calib_ok")
+                print(f"★ 成功: プロジェクターの四つ角を認識しました {self.corners}")
+            else:
+                print("★ 四隅を認識できませんでした (設定は変えていません)")
+            self.calib_step = CALIB_IDLE
+            self.reset_game(quiet=True)
+
+    def step(self, cam_frame, now):
+        """カメラ1フレームを処理して (投影画面, 監視画面) を返す。"""
+        self._calibration_step(cv2.cvtColor(cam_frame, cv2.COLOR_BGR2GRAY), now)
+
+        warped_bgr = warped_gray = None
+        if len(self.corners) == 4:
+            try:
+                warped_bgr, warped_gray = warp_to_projector(cam_frame, self.corners)
+                if self.bg_gray is None:
+                    self.bg_gray = warped_gray.copy()
+            except Exception:
+                warped_bgr = warped_gray = None
+
+        dart_mask = None
+        if self.calib_step == CALIB_IDLE:
+            if self.game.phase == COOLDOWN:
+                if self.game.update(now) and warped_gray is not None:
+                    self.bg_gray = warped_gray.copy()
+            elif warped_bgr is not None and self.bg_gray is not None:
+                try:
+                    hit, dart_mask = detect_hit(self.bg_gray, warped_bgr, frame_gray=warped_gray)
+                    if hit is not None:
+                        self._register(hit[0], hit[1], now)
+                except Exception as e:
+                    print("Hit error:", e)
+
+        proj = render_projector(config.PROJ_W, config.PROJ_H, config.TARGET_CENTER, config.RADII,
+                                self.game.total_score, self.game.hits,
+                                self.game.cooldown_progress(now),
+                                self.calib_step == CALIB_FLASH, now)
+        monitor = render_monitor(cam_frame, self.corners, self.selected, self.click_step,
+                                 warped_bgr, dart_mask, config.CORNER_LABELS, config.CORNER_COLORS)
+        return proj, monitor
+
+
+# ---------------------------------------------------------------- 起動
+def init_camera():
+    backends = [cv2.CAP_DSHOW, cv2.CAP_ANY] if platform.system() == "Windows" else [cv2.CAP_ANY]
+    for cam_id in [config.CAMERA_ID, 1, 2, 0]:
+        for backend in backends:
+            cap = cv2.VideoCapture(cam_id, backend)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_SIZE[0])
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_SIZE[1])
+                    print(f"カメラ (ID: {cam_id}) に接続しました。")
+                    return cap
+                cap.release()
+    return None
+
+
+def demo_frame():
+    """--demo 用のダミーカメラ画像。"""
+    img = np.full((config.CAMERA_SIZE[1], config.CAMERA_SIZE[0], 3), 40, np.uint8)
+    cv2.putText(img, "DEMO MODE - NO CAMERA", (120, 250), cv2.FONT_HERSHEY_DUPLEX, 0.8,
+                (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(img, "click the projector window to shoot", (130, 285), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (160, 160, 160), 1, cv2.LINE_AA)
+    return img
+
+
+def _windows_closed():
+    try:
+        return (cv2.getWindowProperty(WIN_CAM, cv2.WND_PROP_AUTOSIZE) < 0
+                or cv2.getWindowProperty(WIN_PROJ, cv2.WND_PROP_AUTOSIZE) < 0)
+    except cv2.error:
+        return False
+
+
+def print_help(demo):
+    print("=========================================================")
+    print(" ナーフ射的ゲーム" + (" [DEMO: 投影画面クリックで着弾]" if demo else ""))
+    print("=========================================================")
+    print(" [C] / AUTO ALIGN : プロジェクターを光らせて四隅を自動認識")
+    print(" [M] / CLICK 4-PT : カメラ画面で4点クリックして手動設定")
+    print(" クリック/ドラッグ: 一番近い角を動かす")
+    print(" [TAB]            : 微調整する角を切替")
+    print(" 矢印 / WASD      : 選択中の角を2pxずつ移動")
+    print(" [R] / 右クリック : スコアと背景をリセット")
+    print(" [F]              : 投影画面の全画面切替")
+    print(" [ESC] / [Q]      : 終了")
+    print("=========================================================")
+
+
+def run(demo=False):
+    sound.init()
+    app = App(demo=demo)
+    cap = None
+    if not demo:
+        cap = init_camera()
+        if cap is None:
+            print("エラー: カメラが見つかりませんでした。 (カメラなしで試すなら --demo)")
+            input("Enterキーを押すと終了します...")
+            return
+
+    cv2.namedWindow(WIN_CAM, cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(WIN_PROJ, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN_PROJ, config.PROJ_W, config.PROJ_H)
+    cv2.setMouseCallback(WIN_CAM, app.on_camera_mouse)
+    cv2.setMouseCallback(WIN_PROJ, app.on_proj_mouse)
+    print_help(demo)
+
+    dummy = demo_frame() if demo else None
+    try:
+        while True:
+            if _windows_closed():
+                break
+            if demo:
+                frame = dummy
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+            proj, monitor = app.step(frame, time.time())
+            cv2.imshow(WIN_CAM, monitor)
+            cv2.imshow(WIN_PROJ, proj)
+            if not app.handle_key(cv2.waitKeyEx(1)):
+                break
+    finally:
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="ナーフ射的 プロジェクションマッピングゲーム")
+    p.add_argument("--demo", action="store_true", help="カメラなし。投影画面のクリックを着弾として扱う")
+    args = p.parse_args(argv)
+    run(demo=args.demo)

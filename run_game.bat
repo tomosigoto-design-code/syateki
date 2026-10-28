@@ -15,16 +15,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/3] Installing opencv-python and numpy...
-python -m pip install opencv-python numpy
+echo [2/3] Installing requirements (opencv-python, numpy)...
+python -m pip install -r requirements.txt
 
 echo [3/3] Starting Game...
 echo.
 echo --------------------------------------------
 echo  Controls:
-echo    [B]   : Reset Background
-echo    [R]   : Reset Score
-echo    [ESC] : Exit
+echo    [C]          : Auto align corners (flash)
+echo    [M]          : Click 4 corners manually
+echo    [TAB]        : Select corner
+echo    Arrows/WASD  : Move selected corner (2px)
+echo    [R]          : Reset score and background
+echo    [F]          : Fullscreen projector view
+echo    [ESC]/[Q]    : Exit
 echo --------------------------------------------
 echo.
 python nerf_target.py
