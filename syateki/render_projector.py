@@ -1,4 +1,5 @@
-"""投影画面の描画(ダーツボード + 中継風スコアバー)。
+"""投影画面の描画(3色リングの的 + 中継風スコアバー)。
+mode="fever" ではブルがパチンコ風に派手になり、2倍タイム(bonus_start〜bonus_until)は龍と炎のリングが出る。
 
 状態は持たない。アニメーションは hits[].t と now だけから計算する。
 静的な部分(背景・ボード・スコアバーの枠・四隅マーカー)はサイズごとにキャッシュする。
@@ -786,15 +787,17 @@ def _draw_fever_badge(frame, w, h, center, radii):
 
 
 def _draw_fever_outer(frame, w, h, center, radii, hit, age, streak, dragon=False, fire=False):
-    """dragon=True(2倍タイムの発動中)は龍とテロップが主役なので、バーストと大当たり文字を省く。"""
+    """dragon=True(2倍タイム中)は龍と炎が主役なので、ブルの外側演出は省く(描画時間・輝度対策)。"""
     if not dragon:
         _draw_sunburst(frame, center, age, wedges=not fire)   # 炎と重なるときは帯を省く(平均輝度対策)
-    _draw_stars(frame, center, hit, age, n=30 if dragon else 60)
-    _draw_confetti(frame, center, radii, hit, age, n=70 if dragon else (140 if fire else 200),
-                   palette=RAINBOW, a=_fever_fade(age), seed=11)
+    if not dragon:
+        _draw_stars(frame, center, hit, age)
+        _draw_confetti(frame, center, radii, hit, age, n=140 if fire else 200, palette=RAINBOW, a=_fever_fade(age),
+                       seed=11)
     if not dragon:
         _draw_rain(frame, hit, age)
-    _draw_marquee(frame, age, step=40 if dragon else 30)
+    if not dragon:
+        _draw_marquee(frame, age)
     if not dragon:
         _draw_fever_telops(frame, w, h, center, age, streak)
         _draw_jackpot(frame, w, h, center, age)
@@ -802,113 +805,130 @@ def _draw_fever_outer(frame, w, h, center, radii, hit, age, streak, dragon=False
 
 # ---------------------------------------------------------------- bonus (fever の2倍タイム: 龍 + 炎のリング)
 # bonus_start <= now < bonus_until の間だけ。龍・炎・テロップはすべて半径300の外(描いた後に円内を静的画像へ戻す)。
-DRAGON_T = 2.1           # 発動演出(龍)の長さ
-DRAGON_R0 = 345          # 龍が回る軌道の半径
-DRAGON_N = 46            # 胴の節の数
+DRAGON_T = 3.0           # 発動演出(入場・ブレス・印・稲妻・テロップ)の長さ。龍そのものは bonus_until まで舞う
+DRAGON_R0 = 350          # 龍が回る軌道の半径
+DRAGON_N = 44            # 胴の節の数
+DRAGON_EXIT = 1.0        # 終了何秒前から画面外へ去るか
 FIRE_FADE = 1.0          # 終了何秒前から炎が弱まるか
+OMEGA, OMEGA_X = 2.1, 4.8    # 周回 / 退場の角速度 (rad/s)
 D_RED = (34, 36, 196)
 D_RED_DK = (20, 20, 110)
 D_RED_HI = (70, 80, 240)
 D_GOLD = (50, 185, 245)
 D_GOLD_DK = (20, 110, 170)
 D_CREAM = (170, 225, 245)
+PAL_RED = {"main": D_RED, "dk": D_RED_DK, "hi": D_RED_HI, "belly": D_GOLD, "scale": D_GOLD_DK,
+           "fin": D_GOLD, "fin2": D_RED, "snout": D_GOLD, "glow": (30, 40, 170)}
+PAL_GOLD = {"main": (30, 140, 205), "dk": (15, 70, 125), "hi": (90, 195, 240), "belly": (140, 200, 225),
+            "scale": (20, 110, 170), "fin": D_RED, "fin2": (30, 120, 210), "snout": D_CREAM, "glow": (30, 140, 200)}
+PHI_START = math.pi * 0.62 - 0.9
 
 
-def _dragon_points(center, phi, phi0, t):
-    """龍の軌道(phi は配列)。外から渦を巻いて入り、ボードの外周を回って、渦を巻いて去る。"""
-    a_in, a_out = phi0 + 0.8, phi0 + 0.8 + 3.7
-    r = DRAGON_R0 + 700 * np.maximum(0.0, a_in - phi) + 420 * np.maximum(0.0, phi - a_out) ** 1.3
-    r = r + 9 * np.sin(phi * 9 - t * 10)                                  # うねり
+def _dragon_phase(t, total):
+    """頭の角度 Φ(t) と退場開始の角度 Φ(te)。周回は OMEGA、退場は OMEGA_X で加速する。t は配列でもよい。"""
+    te = total - DRAGON_EXIT
+    phi = PHI_START + OMEGA * t + (OMEGA_X - OMEGA) * np.maximum(0.0, t - te)
+    return phi, PHI_START + OMEGA * te
+
+
+def _dragon_path(center, t, total, sgn):
+    """龍の頭が時刻 t(配列)にいる位置。外から渦を巻いて入り、外周を回り、最後は渦を巻いて画面外へ去る。
+    sgn=±1 でうねりを逆位相にして、2匹が絡み合うように交差させる。"""
+    t = np.asarray(t, np.float64)
+    phi, _ = _dragon_phase(t, total)
+    te = total - DRAGON_EXIT
+    r = DRAGON_R0 + 650 * np.clip((0.45 - t) / 0.45, 0, None) ** 1.2 + 900 * np.maximum(0.0, t - te) ** 1.4
+    r = r + sgn * 17 * np.sin(t * 9)
     return np.stack([center[0] + np.cos(phi) * r, center[1] + np.sin(phi) * r], 1)
 
 
-def _draw_dragon(frame, center, t):
-    """龍。胴は太さの変わる帯を多角形で塗る(縁取り → 胴 → 背の光沢 → 腹の金 → 鱗)。"""
-    if not 0 <= t < DRAGON_T:
-        return
-    phi0 = math.pi * 0.62
-    phi_h = phi0 + 0.15 + 4.15 * t                          # 頭の角度(時計回り)
-    N = DRAGON_N
-    P = _dragon_points(center, phi_h - np.arange(N + 1) * 0.046, phi0, t)
+def _dragon_geom(center, t, total, sgn, size, n=DRAGON_N, seg=18.0):
+    """胴の節。頭の過去の軌跡を一定の間隔(弧長 seg)でたどる(列車のように、どの速さでも胴の長さは一定)。"""
+    hist = _dragon_path(center, t - np.arange(0, 220) * 0.008, total, sgn)
+    d = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(hist, axis=0).T))])
+    s_ = np.arange(n + 1) * seg * size
+    P = np.stack([np.interp(s_, d, hist[:, 0]), np.interp(s_, d, hist[:, 1])], 1)
     tang = P[:-1] - P[1:]
     tang /= np.maximum(1e-6, np.hypot(tang[:, 0], tang[:, 1]))[:, None]
     nrm = np.stack([-tang[:, 1], tang[:, 0]], 1)
     flip = np.sign((nrm * (P[:-1] - np.array(center))).sum(1))[:, None]   # 背中は外向き
     nrm = nrm * np.where(flip == 0, 1, flip)
-    j = np.arange(N)
-    width = 22 * (0.7 + 0.3 * np.sin(np.clip(j / 8, 0, 1) * math.pi / 2)) * (1 - 0.82 * (j / N) ** 1.3)
+    j = np.arange(n)
+    width = size * 26 * (0.7 + 0.3 * np.sin(np.clip(j / 8, 0, 1) * math.pi / 2)) * (1 - 0.82 * (j / n) ** 1.3)
+    return P, tang, nrm, width
+
+
+def _i32(a):
+    return np.round(a).astype(np.int32)
+
+
+def _draw_dragon_body(frame, P, tang, nrm, width, t, pal, hs, legs=True, detail=True):
+    """胴は太さの変わる帯を多角形で塗る(縁取り → 胴 → 背の光沢 → 腹 → 鱗)、背びれ・脚・尾の房。"""
+    N = DRAGON_N
     Q = P[:N]
     Wn = nrm * width[:, None]
     ip = lambda v: (int(round(v[0])), int(round(v[1])))
-    i32 = lambda a: np.round(a).astype(np.int32)
-
-    # 背びれ(のこぎり状のたてがみ): 外側の暗い三角 + 内側の色付き三角
     ks = np.arange(2, N - 1, 2)
     fl = width[ks] * 0.8 + 5 + 3 * np.sin(t * 12 + ks)
     T, Nn = tang[ks], nrm[ks]
     base = Q[ks] + Nn * (width[ks] * 0.5)[:, None]
-    tip = Q[ks] + Nn * (width[ks] + fl)[:, None] - T * 14
-    fins = np.stack([base + T * 9, tip, base - T * 11], 1)
+    tip = Q[ks] + Nn * (width[ks] + fl)[:, None] - T * 15
+    fins = np.stack([base + T * 10, tip, base - T * 12], 1)
     inner = np.stack([fins[:, 0], (fins[:, 0] + fins[:, 1]) / 2, fins[:, 2]], 1)
-    gold = ks % 4 == 0
-    for par in (0, 1):   # 隣どうしは重なるので偶奇に分ける(fillPoly は重なりを穴にする)
-        sel = (np.arange(len(ks)) % 2) == par
-        cv2.fillPoly(frame, list(i32(fins[sel])), D_RED_DK, AA)
-    cv2.fillPoly(frame, list(i32(inner[gold])), D_GOLD, AA)
-    cv2.fillPoly(frame, list(i32(inner[~gold])), D_RED, AA)
-    # 脚(腹側に2対、金の爪)
-    for k in (11, 29):
+    alt = (np.arange(len(ks)) % 2) == 0
+    for sel in (alt, ~alt):   # 隣どうしは重なるので分ける(fillPoly は重なりを穴にする)
+        cv2.fillPoly(frame, list(_i32(fins[sel])), pal["dk"], AA)
+    if detail:
+        cv2.fillPoly(frame, list(_i32(inner[alt])), pal["fin"], AA)
+        cv2.fillPoly(frame, list(_i32(inner[~alt])), pal["fin2"], AA)
+    for k in ((10, 27) if legs else ()):                 # 脚(腹側に2対、爪)
         (tx, ty), (nx, ny), (x, y), w_ = tang[k], nrm[k], Q[k], width[k]
-        for d in (-5, 5):
+        for d in (-6, 6):
             sw = 6 * math.sin(t * 14 + k + d)
             b = (x - nx * w_ * 0.6 + tx * d, y - ny * w_ * 0.6 + ty * d)
-            kn = (b[0] - nx * 16 + tx * (sw - 6), b[1] - ny * 16 + ty * (sw - 6))
-            ft = (kn[0] - nx * 4 + tx * 10, kn[1] - ny * 4 + ty * 10)
-            cv2.line(frame, ip(b), ip(kn), D_RED_DK, 7, AA)
-            cv2.line(frame, ip(b), ip(kn), D_RED, 4, AA)
-            cv2.line(frame, ip(kn), ip(ft), D_RED, 4, AA)
+            kn = (b[0] - nx * 19 + tx * (sw - 7), b[1] - ny * 19 + ty * (sw - 7))
+            ft = (kn[0] - nx * 4 + tx * 11, kn[1] - ny * 4 + ty * 11)
+            cv2.line(frame, ip(b), ip(kn), pal["dk"], 8, AA)
+            cv2.line(frame, ip(b), ip(kn), pal["main"], 5, AA)
+            cv2.line(frame, ip(kn), ip(ft), pal["main"], 5, AA)
             for c_ in (-1, 0, 1):
-                cl = (ft[0] - nx * (5 - c_ * 2) + tx * (4 + c_ * 3), ft[1] - ny * (5 - c_ * 2) + ty * (4 + c_ * 3))
+                cl = (ft[0] - nx * (6 - c_ * 2) + tx * (5 + c_ * 3), ft[1] - ny * (6 - c_ * 2) + ty * (5 + c_ * 3))
                 cv2.line(frame, ip(ft), ip(cl), D_CREAM, 2, AA)
 
     def band(off, half, col, outline=None):
         c_ = Q + Wn * off
-        poly = np.concatenate([c_ + Wn * half, (c_ - Wn * half)[::-1]])
-        cv2.fillPoly(frame, [i32(poly)], col, AA)
+        poly = _i32(np.concatenate([c_ + Wn * half, (c_ - Wn * half)[::-1]]))
+        cv2.fillPoly(frame, [poly], col, AA)
         if outline is not None:
-            cv2.polylines(frame, [i32(poly)], True, outline, 2, AA)
+            cv2.polylines(frame, [poly], True, outline, 2, AA)
 
-    band(0, 1.0, D_RED, D_RED_DK)
-    band(0.38, 0.42, D_RED_HI)
-    band(-0.58, 0.36, D_GOLD)
-    # 鱗(背中側の弧)と腹の節
-    kk = np.arange(1, N - 1, 2)
+    band(0, 1.0, pal["main"], pal["dk"])
+    band(0.38, 0.42, pal["hi"])
+    band(-0.58, 0.36, pal["belly"])
+    kk = np.arange(1, N - 1, 2 if detail else 4)
     arc = np.linspace(-0.9, 0.9, 5)
     c_ = Q[kk] + Wn[kk] * 0.15
     r_ = (width[kk] * 0.55)[:, None, None]
-    T, Nn = tang[kk][:, None, :], nrm[kk][:, None, :]
-    scales = c_[:, None, :] + (-T * np.cos(arc)[None, :, None] + Nn * np.sin(arc)[None, :, None]) * r_
-    cv2.polylines(frame, list(i32(scales)), False, D_GOLD_DK, 1, AA)
+    T2, N2 = tang[kk][:, None, :], nrm[kk][:, None, :]
+    scales = c_[:, None, :] + (-T2 * np.cos(arc)[None, :, None] + N2 * np.sin(arc)[None, :, None]) * r_
+    cv2.polylines(frame, list(_i32(scales)), False, pal["scale"], 1, AA)
     bc = Q[kk] - Wn[kk] * 0.58
-    plates = np.stack([bc + Wn[kk] * 0.33, bc - Wn[kk] * 0.33], 1)
-    cv2.polylines(frame, list(i32(plates)), False, D_GOLD_DK, 1, AA)
-    # 尾の房(炎のような毛)
+    cv2.polylines(frame, list(_i32(np.stack([bc + Wn[kk] * 0.33, bc - Wn[kk] * 0.33], 1))), False, pal["scale"], 1, AA)
     xt, yt = P[N - 1]
     tx, ty = tang[N - 2]
     nx, ny = nrm[N - 2]
-    for s_ in (-1, 0, 1):
+    for s_ in (-1, 0, 1):                                # 尾の房
         sw = 6 * math.sin(t * 13 + s_)
-        tip = (xt - tx * 34 + nx * (s_ * 14 + sw), yt - ty * 34 + ny * (s_ * 14 + sw))
-        cv2.fillConvexPoly(frame, np.array([[xt + nx * 5, yt + ny * 5], tip, [xt - nx * 5, yt - ny * 5]], np.int32),
-                           D_GOLD if s_ else D_RED, AA)
-    _draw_dragon_head(frame, P[0] + tang[0] * 6, tang[0], nrm[0], t)
+        tipp = (xt - tx * 40 + nx * (s_ * 16 + sw), yt - ty * 40 + ny * (s_ * 16 + sw))
+        cv2.fillConvexPoly(frame, _i32(np.array([[xt + nx * 6, yt + ny * 6], tipp, [xt - nx * 6, yt - ny * 6]])),
+                           pal["fin"] if s_ else pal["fin2"], AA)
+    _draw_dragon_head(frame, P[0] + tang[0] * 6, tang[0], nrm[0], t, pal, hs)
 
 
-def _draw_dragon_head(frame, p, f, n, t):
+def _draw_dragon_head(frame, p, f, n, t, pal=PAL_RED, HS=1.6):
     x, y = p
     fx, fy = f
     nx, ny = n
-    HS = 1.6
 
     def q(a, b):                                       # 頭の座標系 (前方 a, 背側 b)
         return (int(x + (fx * a + nx * b) * HS), int(y + (fy * a + ny * b) * HS))
@@ -917,48 +937,333 @@ def _draw_dragon_head(frame, p, f, n, t):
         cv2.ellipse(frame, q(a, b), (int(ax * HS), int(ay * HS)), ang, a0, a1, col, th, AA)
 
     ang = math.degrees(math.atan2(fy, fx))
-    # たてがみ(後ろへ流れる)
-    for i in range(6):
+    for i in range(6):                                 # たてがみ(後ろへ流れる)
         sway = 5 * math.sin(t * 14 + i)
-        poly = np.array([q(-2 - i * 6, 12 - i), q(-30 - i * 7, 26 + i * 2 + sway), q(-14 - i * 6, 2)], np.int32)
-        cv2.fillConvexPoly(frame, poly, D_RED_DK if i % 2 else D_RED, AA)
+        cv2.fillConvexPoly(frame, np.array([q(-2 - i * 6, 12 - i), q(-30 - i * 7, 26 + i * 2 + sway), q(-14 - i * 6, 2)],
+                                           np.int32), pal["dk"] if i % 2 else pal["main"], AA)
         cv2.fillConvexPoly(frame, np.array([q(-6 - i * 6, 9), q(-24 - i * 7, 20 + i * 2 + sway), q(-14 - i * 6, 4)],
-                                           np.int32), D_GOLD, AA)
-    # 角(2本、後ろへ反る)
-    for off, col in ((0, D_CREAM), (8, D_GOLD)):
+                                           np.int32), pal["fin"], AA)
+    for off, col in ((0, D_CREAM), (8, D_GOLD)):        # 角(2本、後ろへ反る)
         horn = [q(-2 - off - k * 6, 15 + k * 4.5 - k * k * 0.55) for k in range(7)]
         for k in range(6):
             cv2.line(frame, horn[k], horn[k + 1], col, max(2, int((6 - k) * HS * 0.8)), AA)
-    # 下あご(口を開け閉め)・舌・牙
-    gape = 7 + 5 * math.sin(t * 12)
+    gape = 8 + 5 * math.sin(t * 12)                    # 下あご・舌・牙
     cv2.fillConvexPoly(frame, np.array([q(0, -6), q(40, -12 - gape), q(36, -2), q(10, 0)], np.int32), (25, 15, 100), AA)
-    cv2.fillConvexPoly(frame, np.array([q(-2, -6), q(38, -14 - gape), q(35, -21 - gape), q(2, -17)], np.int32), D_RED_DK, AA)
-    cv2.fillConvexPoly(frame, np.array([q(-1, -8), q(36, -15 - gape), q(33, -19 - gape), q(3, -15)], np.int32), D_RED, AA)
+    cv2.fillConvexPoly(frame, np.array([q(-2, -6), q(38, -14 - gape), q(35, -21 - gape), q(2, -17)], np.int32),
+                       pal["dk"], AA)
+    cv2.fillConvexPoly(frame, np.array([q(-1, -8), q(36, -15 - gape), q(33, -19 - gape), q(3, -15)], np.int32),
+                       pal["main"], AA)
     cv2.line(frame, q(14, -5 - gape * 0.3), q(46, -8 - gape * 0.4), (60, 60, 230), max(2, int(2 * HS)), AA)
     for k in range(3):
         cv2.fillConvexPoly(frame, np.array([q(16 + k * 7, -2), q(18 + k * 7, -8), q(21 + k * 7, -2)], np.int32),
                            (235, 240, 245), AA)
     cv2.fillConvexPoly(frame, np.array([q(30, -14 - gape), q(32, -8 - gape), q(34, -15 - gape)], np.int32),
                        (235, 240, 245), AA)
-    # 頭蓋・鼻づら・ほお
-    e(0, 2, 24, 17, 0, 360, D_RED_DK)
-    e(0, 2, 22, 15, 0, 360, D_RED)
-    e(-2, 7, 14, 7, 0, 360, D_RED_HI)
-    e(25, 1, 20, 10, 0, 360, D_RED_DK)
-    e(25, 1, 19, 9, 0, 360, D_GOLD)
+    e(0, 2, 24, 17, 0, 360, pal["dk"])                 # 頭蓋・鼻づら
+    e(0, 2, 22, 15, 0, 360, pal["main"])
+    e(-2, 7, 14, 7, 0, 360, pal["hi"])
+    e(25, 1, 20, 10, 0, 360, pal["dk"])
+    e(25, 1, 19, 9, 0, 360, pal["snout"])
     e(26, 3, 15, 5, 0, 360, D_CREAM)
-    cv2.circle(frame, q(41, 5), max(2, int(2 * HS)), (20, 20, 40), -1, AA)  # 鼻の穴
-    # 眉と目(金の目、縦長の瞳)
-    e(4, 10, 12, 6, 180, 360, D_GOLD, max(2, int(3 * HS)))
+    cv2.circle(frame, q(41, 5), max(2, int(2 * HS)), (20, 20, 40), -1, AA)
+    e(4, 10, 12, 6, 180, 360, pal["fin"], max(2, int(3 * HS)))     # 眉と目
     cv2.circle(frame, q(5, 7), int(6 * HS), (20, 20, 40), -1, AA)
     cv2.circle(frame, q(5, 7), int(5 * HS), (40, 215, 250), -1, AA)
     cv2.ellipse(frame, q(6, 7), (max(1, int(1.3 * HS)), int(4.5 * HS)), ang + 90, 0, 360, (10, 10, 10), -1, AA)
     cv2.circle(frame, q(3, 9), max(1, int(1.2 * HS)), (255, 255, 255), -1, AA)
-    # ひげ(長く、なびく)
-    for side in (1, -1):              # 鼻先から前へ出て、外側へ大きく弧を描いて後ろへ流れる
+    for side in (1, -1):                               # ひげ
         wh = [q(42 + 10 * math.sin(k * 0.35) - k * 4.5, side * (4 + k * 2.6) + 5 * math.sin(k * 0.7 - t * 11 + side))
               for k in range(13)]
         cv2.polylines(frame, [np.array(wh, np.int32)], False, D_GOLD, 2, AA)
+
+
+def _mouth(P, tang, nrm, hs):
+    """頭の口先の位置(ブレスの出どころ)。"""
+    p = P[0] + tang[0] * 6
+    return p + tang[0] * 42 * hs - nrm[0] * 12 * hs
+
+
+def _breath_dir(tang, nrm):
+    """ブレスの向き: 前方やや内側(炎のリングに当たる向き)。"""
+    d = tang[0] * 0.85 - nrm[0] * 0.5
+    return d / np.hypot(*d)
+
+
+def _draw_breath(frame, glow, gs, src, f, t, k):
+    """火炎ブレス(口から前方やや内側へ広がる炎の粒)。加算で重ねるので、消えかけの粒は透けて消える。"""
+    n = 16
+    i = np.arange(n)
+    life = (t * 3.0 + i / n) % 1.0
+    d = 12 + life * 170
+    spread = (np.sin(i * 2.3 + t * 9) * 0.5) * life * 60
+    nrm = np.array([-f[1], f[0]])
+    pts = src[None, :] + f[None, :] * d[:, None] + nrm[None, :] * spread[:, None]
+    rad = 4 + life * 16
+    cols = [_scale((90, 235, 255) if lj < 0.25 else ((30, 150, 255) if lj < 0.6 else (30, 60, 230)),
+                   k * (1 - lj) ** 0.8) for lj in life]
+    if glow is not None:
+        for j in range(n):
+            cv2.circle(glow, (int(pts[j, 0] * gs), int(pts[j, 1] * gs)), max(1, int(rad[j] * gs * 1.6)), cols[j], -1)
+    if frame is None:
+        return
+    H, W = frame.shape[:2]
+    x0, y0 = max(0, int((pts[:, 0] - rad).min()) - 2), max(0, int((pts[:, 1] - rad).min()) - 2)
+    x1, y1 = min(W, int((pts[:, 0] + rad).max()) + 3), min(H, int((pts[:, 1] + rad).max()) + 3)
+    if x1 <= x0 or y1 <= y0:
+        return
+    lay = np.zeros((y1 - y0, x1 - x0, 3), np.uint8)
+    for j in np.argsort(-life):
+        cv2.circle(lay, (int(pts[j, 0]) - x0, int(pts[j, 1]) - y0), int(rad[j]), cols[j], -1, AA)
+    roi = frame[y0:y1, x0:x1]
+    cv2.add(roi, lay, dst=roi)
+
+
+def _draw_pearl(frame, glow, gs, p, t):
+    """龍が追う宝珠(火の玉)。"""
+    x, y = int(p[0]), int(p[1])
+    if glow is not None:
+        cv2.circle(glow, (int(x * gs), int(y * gs)), max(2, int(34 * gs)), (40, 170, 240), -1)
+    if frame is None:
+        return
+    for i in range(3):                                 # 宝珠を巻く炎
+        a0 = t * 400 + i * 120
+        cv2.ellipse(frame, (x, y), (22, 22), a0, 0, 80, (20, 120, 250), 4, AA)
+    cv2.circle(frame, (x, y), 15, (30, 150, 245), -1, AA)
+    cv2.circle(frame, (x, y), 11, (150, 235, 255), -1, AA)
+    cv2.circle(frame, (x - 4, y - 4), 4, (245, 252, 255), -1, AA)
+
+
+def _trail_points(center, t, total, sgn, n, seed):
+    """頭が通った跡の光の粒の位置(過去の頭の位置 + 時刻で決まる揺らぎ)。"""
+    lag = np.arange(1, n + 1) * 0.045
+    pts = _dragon_path(center, t - lag, total, sgn)
+    j = np.arange(n) + seed
+    jit = np.stack([np.sin(j * 12.9898 + t * 3), np.cos(j * 78.233 + t * 2)], 1) * (8 + lag[:, None] * 60)
+    return pts + jit
+
+
+def _draw_trail(frame, glow, gs, pts):
+    """金の光跡(粒)。新しいほど大きく明るい。"""
+    n = len(pts)
+    for i in range(n):
+        a = (1 - i / n) ** 1.2
+        c = _scale((90, 215, 255), a)
+        if frame is not None:
+            cv2.circle(frame, (int(pts[i, 0]), int(pts[i, 1])), max(1, int(3.5 * a + 0.5)), c, -1, AA)
+        if glow is not None:
+            cv2.circle(glow, (int(pts[i, 0] * gs), int(pts[i, 1] * gs)), max(1, int(9 * a * gs + 0.5)), _scale(c, 0.8),
+                       -1)
+
+
+def _draw_lightning(frame, glow, gs, center, t, seed, size=(1280, 720)):
+    """発動中に何度か走る稲妻(円の外、画面の縁からボードの縁へ)。"""
+    w, h = size
+    for b, (t0, dur) in enumerate(((0.28, 0.16), (0.95, 0.13), (1.7, 0.15), (2.4, 0.12))):
+        if not t0 <= t < t0 + dur:
+            continue
+        a = 1.0 if t < t0 + dur * 0.5 else 0.85 if int(t * 40) % 2 else 0.5     # ちらつき
+        rng = np.random.default_rng(seed + b)
+        ang = rng.uniform(0, 2 * math.pi)
+        end = np.array([center[0] + math.cos(ang) * (QUIET_R + 20), center[1] + math.sin(ang) * (QUIET_R + 20)])
+        start = np.array([center[0] + math.cos(ang) * 900, center[1] + math.sin(ang) * 900])
+        start = np.clip(start, (0, 0), (w - 1, h - 1))
+        n = 11
+        s = np.linspace(0, 1, n)[:, None]
+        path = start + (end - start) * s
+        perp = np.array([-(end - start)[1], (end - start)[0]]) / max(1.0, np.hypot(*(end - start)))
+        off = rng.normal(0, 18, n)
+        off[0] = off[-1] = 0
+        path = path + perp[None, :] * off[:, None]
+        bolts = [path]
+        for _ in range(2):                             # 枝
+            k0 = rng.integers(2, n - 3)
+            br = [path[k0]]
+            d = (end - start) / n * 0.8 + perp * rng.normal(0, 25)
+            for _ in range(4):
+                br.append(br[-1] + d + perp * rng.normal(0, 12))
+            bolts.append(np.array(br))
+        for bp in bolts:
+            if glow is not None:
+                cv2.polylines(glow, [_i32(bp * gs)], False, _scale((255, 160, 200), a), 3)
+            if frame is not None:
+                cv2.polylines(frame, [_i32(bp)], False, _scale((255, 140, 190), a), 5, AA)
+                cv2.polylines(frame, [_i32(bp)], False, _scale((255, 245, 250), a), 2, AA)
+
+
+_CLOUDS = ((-1, 175, 625, 1.0), (1, 1125, 95, 0.85), (-1, 1120, 640, 0.9))
+
+
+def _cloud_sprite(d, s_):
+    """瑞雲のスプライト(BGR, mask)。金の縁取りの塊 + 渦巻き + たなびく尾。"""
+    key = ("cloud", d, s_)
+    if key in _glyph_cache:
+        return _glyph_cache[key]
+    W, H = int(260 * s_), int(110 * s_)
+    img = np.zeros((H, W, 3), np.uint8)
+    m = np.zeros((H, W), np.uint8)
+    x, y = W / 2 - 20 * s_ * d, H / 2
+    lumps = [(-48, 6, 20), (-22, -10, 26), (8, -14, 30), (38, -4, 24), (60, 8, 16), (14, 10, 24), (-20, 12, 20)]
+    for dx, dy, r in lumps:
+        c = (int(x + dx * s_ * d), int(y + dy * s_))
+        cv2.circle(img, c, int((r + 3) * s_), D_GOLD, -1, AA)
+        cv2.circle(m, c, int((r + 3) * s_), 255, -1, AA)
+    for dx, dy, r in lumps:
+        cv2.circle(img, (int(x + dx * s_ * d), int(y + dy * s_)), int(r * s_), (70, 35, 120), -1, AA)
+    for i, (dx, dy, r) in enumerate(lumps[:5]):
+        c = (int(x + dx * s_ * d), int(y + dy * s_))
+        rr = int(r * s_ * 0.55)
+        cv2.ellipse(img, c, (rr, rr), (i * 70) % 360, 0, 270, D_GOLD, 2, AA)
+        cv2.ellipse(img, c, (rr // 2, rr // 2), (i * 70 + 90) % 360, 0, 240, D_GOLD, 2, AA)
+    tail = np.array([(int(x + (60 + k * 14) * s_ * d), int(y + (12 + 6 * math.sin(k * 0.9)) * s_)) for k in range(7)],
+                    np.int32)
+    cv2.polylines(img, [tail], False, D_GOLD, 3, AA)
+    cv2.polylines(m, [tail], False, 255, 3, AA)
+    _glyph_cache[key] = (img, (m > 100).astype(np.uint8) * 255)
+    return _glyph_cache[key]
+
+
+def _draw_clouds(frame, t, a, shake):
+    """瑞雲が隅をゆっくり流れる(スプライトを動かすだけ)。"""
+    if a <= 0:
+        return
+    H, W = frame.shape[:2]
+    for i, (d, cx, cy, s_) in enumerate(_CLOUDS):
+        img, m = _cloud_sprite(d, s_)
+        sh, sw = m.shape
+        x0 = int(cx + d * 30 * math.sin(t * 0.7 + i) + shake[0] - sw / 2)
+        y0 = int(cy + 5 * math.sin(t * 1.3 + i * 2) + shake[1] - sh / 2)
+        fx0, fy0, fx1, fy1 = max(0, x0), max(0, y0), min(W, x0 + sw), min(H, y0 + sh)
+        if fx1 <= fx0 or fy1 <= fy0:
+            continue
+        sub = (slice(fy0 - y0, fy1 - y0), slice(fx0 - x0, fx1 - x0))
+        roi = frame[fy0:fy1, fx0:fx1]
+        if a >= 1:
+            cv2.copyTo(img[sub], m[sub], roi)
+        else:
+            mixed = cv2.addWeighted(img[sub], a, roi, 1 - a, 0)
+            cv2.copyTo(mixed, m[sub], roi)
+
+
+def _seal_image():
+    """判子風の「龍」の印(赤地に白抜き、少し傾けてかすれ付き)。(BGR, alpha) を返す。"""
+    if "seal" in _glyph_cache:
+        return _glyph_cache["seal"]
+    S = 128
+    img = np.zeros((S, S, 3), np.uint8)
+    al = np.zeros((S, S), np.uint8)
+    cv2.rectangle(al, (8, 8), (S - 9, S - 9), 255, -1)
+    img[:] = (40, 30, 195)
+    cv2.rectangle(img, (15, 15), (S - 16, S - 16), (235, 240, 250), 3)
+    m = _ff_mask("龍", 104)
+    if m is None:
+        m = _hershey_mask("x2", 3.0, 7)
+    m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    sc = min(82 / m.shape[0], 82 / m.shape[1])
+    m = cv2.resize(m, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+    y0, x0 = (S - m.shape[0]) // 2, (S - m.shape[1]) // 2
+    img[y0:y0 + m.shape[0], x0:x0 + m.shape[1]][m > 110] = (235, 240, 250)
+    rng = np.random.default_rng(5)                     # かすれ(縁の近くだけ)
+    for _ in range(45):
+        side = rng.integers(0, 4)
+        u = int(rng.integers(8, S - 8))
+        v = int(rng.integers(8, 19))
+        x, y = [(u, v), (S - v, u), (u, S - v), (v, u)][side]
+        cv2.circle(al, (x, y), int(rng.integers(1, 3)), 0, -1)
+    M = cv2.getRotationMatrix2D((S / 2, S / 2), 9, 1.0)
+    img = cv2.warpAffine(img, M, (S, S), flags=cv2.INTER_LINEAR)
+    al = cv2.warpAffine(al, M, (S, S), flags=cv2.INTER_LINEAR)
+    _glyph_cache["seal"] = (img, al)
+    return img, al
+
+
+def _draw_seal(frame, t, shake):
+    """「龍」の印がドーンと押される(t=0.55)。"""
+    t0 = 0.55
+    if t < t0 or t > 2.6:
+        return
+    a = 1.0 if t < 2.2 else max(0.0, (2.6 - t) / 0.4)
+    tau = t - t0
+    sc = 1 + 1.4 * math.exp(-tau * 16)
+    img, al = _seal_image()
+    sz = int(img.shape[0] * sc)
+    img = cv2.resize(img, (sz, sz), interpolation=cv2.INTER_LINEAR)
+    al = cv2.resize(al, (sz, sz), interpolation=cv2.INTER_LINEAR)
+    cx, cy = 150 + shake[0], 140 + shake[1]
+    x0, y0 = int(cx - sz / 2), int(cy - sz / 2)
+    H, W = frame.shape[:2]
+    fx0, fy0, fx1, fy1 = max(0, x0), max(0, y0), min(W, x0 + sz), min(H, y0 + sz)
+    if fx1 <= fx0 or fy1 <= fy0:
+        return
+    sub = (slice(fy0 - y0, fy1 - y0), slice(fx0 - x0, fx1 - x0))
+    roi = frame[fy0:fy1, fx0:fx1]
+    m = cv2.threshold(al[sub], 127, 255, cv2.THRESH_BINARY)[1]
+    a *= min(1.0, tau / 0.04)
+    src = img[sub] if a >= 1 else cv2.addWeighted(img[sub], a, roi, 1 - a, 0)
+    cv2.copyTo(np.ascontiguousarray(src), m, roi)
+
+
+def _shake(t):
+    """印が押された瞬間の、外周要素の揺れ。"""
+    tau = t - 0.55
+    if tau < 0:
+        return (0, 0)
+    e = 10 * math.exp(-tau * 7)
+    return (int(e * math.sin(tau * 61)), int(e * math.cos(tau * 47)))
+
+
+def _draw_dragons(frame, center, t, total, intro, seed, glow):
+    """2匹の龍(赤龍が宝珠を追い、金龍が絡み合うように続く)、光跡、ブレス、稲妻。
+    先に低解像度のグロー(輪郭の光・宝珠・ブレス・稲妻)を加算してから、本体を上に描く。"""
+    h, w = frame.shape[:2]
+    gs = glow.shape[1] / w
+    if not 0 <= t < total:
+        return
+    red = _dragon_geom(center, t, total, 1, 1.0)
+    gold = _dragon_geom(center, t - 0.2, total, -1, 0.82)
+    pearl = _dragon_path(center, np.array([t + 0.16]), total, 0)[0]
+    breath = intro and 0.35 < t < 2.2
+    kb = min(1.0, (t - 0.35) / 0.15) * min(1.0, (2.2 - t) / 0.2) if breath else 0.0
+    for (P, tang, nrm, width), pal in ((gold, PAL_GOLD), (red, PAL_RED)):
+        Wn = nrm * (width * 1.35)[:, None]
+        poly = np.concatenate([P[:DRAGON_N] + Wn, (P[:DRAGON_N] - Wn)[::-1]]) * gs
+        cv2.fillPoly(glow, [_i32(poly)], pal["glow"])
+    n_r, n_g = (12, 8) if intro else (9, 6)
+    tr_r = _trail_points(center, t, total, 1, n_r, 0)
+    tr_g = _trail_points(center, t - 0.2, total, -1, n_g, 50)
+    _draw_trail(None, glow, gs, tr_r)
+    _draw_trail(None, glow, gs, tr_g)
+    _draw_pearl(None, glow, gs, pearl, t)
+    if breath:
+        P, tang, nrm, width = red
+        _draw_breath(None, glow, gs, _mouth(P, tang, nrm, 1.75), _breath_dir(tang, nrm), t, kb)
+    if intro:
+        _draw_lightning(None, glow, gs, center, t, seed, (w, h))
+    glow = cv2.GaussianBlur(glow, (0, 0), 2.2)
+    bx, by, bw, bh = cv2.boundingRect(cv2.cvtColor(glow, cv2.COLOR_BGR2GRAY))   # 光っている範囲だけ拡大・加算
+    if bw and bh:
+        X0, Y0 = int(bx / gs), int(by / gs)
+        X1, Y1 = min(w, int((bx + bw) / gs)), min(h, int((by + bh) / gs))
+        up = cv2.resize(glow[by:by + bh, bx:bx + bw], (X1 - X0, Y1 - Y0), interpolation=cv2.INTER_LINEAR)
+        roi = frame[Y0:Y1, X0:X1]
+        cv2.addWeighted(roi, 1.0, up, 0.45, 0, dst=roi)
+    _draw_trail(frame, None, gs, tr_r)
+    _draw_trail(frame, None, gs, tr_g)
+    _draw_dragon_body(frame, *gold, t, PAL_GOLD, 1.35, legs=False, detail=False)
+    _draw_dragon_body(frame, *red, t, PAL_RED, 1.75)
+    _draw_pearl(frame, None, gs, pearl, t)
+    if breath:
+        P, tang, nrm, width = red
+        _draw_breath(frame, None, gs, _mouth(P, tang, nrm, 1.75), _breath_dir(tang, nrm), t, kb)
+    if intro:
+        _draw_lightning(frame, None, gs, center, t, seed, (w, h))
+
+
+def _fire_cover(t, total):
+    """炎のリングの点火範囲: ブレスが当たった所(頭の少し先)まで。2.0〜2.6 秒で残りも燃え広がる。"""
+    a0 = _dragon_phase(0.35, total)[0] + 0.3
+    a1 = _dragon_phase(min(t, 2.2), total)[0] + 0.3 if t > 0.35 else a0
+    fill = min(1.0, max(0.0, (t - 2.0) / 0.6))
+    return a0, a1, fill
 
 
 def _bonus_level(now, bonus_start, bonus_until):
@@ -970,7 +1275,7 @@ def _bonus_level(now, bonus_start, bonus_until):
     return max(0.0, k)
 
 
-def _draw_fire_ring(frame, center, now, k):
+def _draw_fire_ring(frame, center, now, k, cover=None, glow=None, gs=0.25):
     """的の外周を囲む炎のリング(ノイズで揺らぐ炎の舌 + 火の粉 + 弱いグロー)。半分の解像度で描いて拡大・加算。"""
     if k <= 0:
         return
@@ -982,7 +1287,7 @@ def _draw_fire_ring(frame, center, now, k):
     S = 0.5
     lay = np.zeros(((y1 - y0) // 2, (x1 - x0) // 2, 3), np.uint8)
     ox, oy = (cx - x0) * S, (cy - y0) * S
-    M = 46
+    M = 40
     r0 = (QUIET_R + 2) * S
     layers = (((20, 30, 170), 1.0, 0.8), ((10, 110, 250), 0.66, 0.58), ((120, 230, 255), 0.34, 0.36))
     i = np.arange(M)
@@ -990,6 +1295,17 @@ def _draw_fire_ring(frame, center, now, k):
     L = 34 + 26 * (0.5 * np.sin(now * 7.3 + i * 1.7) + 0.3 * np.sin(now * 11.9 + i * 0.83)
                    + 0.2 * np.sin(now * 4.1 + i * 2.9))
     L = L * (0.55 + 0.45 * k) * S
+    if cover is not None:          # 点火済みの角度だけ燃やす(点火の先端は短い炎から伸びる)
+        a0, a1, fill = cover
+        d = (th - a0) % (2 * math.pi)
+        lit = np.clip((a1 - a0 - d) / 0.5, 0, 1) if a1 > a0 else np.zeros(M)
+        if a1 - a0 >= 2 * math.pi:
+            lit[:] = 1
+        lit = np.maximum(lit, fill)
+        L = L * lit
+        keep = lit > 0.03
+    else:
+        keep = np.ones(M, bool)
     tip_th = th + 0.11 * np.sin(now * 9 + i * 1.3) + 0.05 * np.sin(now * 17 + i * 0.7)
     for col, sl, sw in layers:              # 赤(長い) → 橙 → 黄(短い芯) の順に重ねる
         hw = sw * 2 * math.pi / M
@@ -997,44 +1313,55 @@ def _draw_fire_ring(frame, center, now, k):
         tri = np.stack([np.stack([ox + np.cos(th - hw) * r0, oy + np.sin(th - hw) * r0], 1),
                         np.stack([ox + np.cos(tip_th) * tip_r, oy + np.sin(tip_th) * tip_r], 1),
                         np.stack([ox + np.cos(th + hw) * r0, oy + np.sin(th + hw) * r0], 1)], 1)
-        tri = np.round(tri).astype(np.int32)
+        tri = np.round(tri).astype(np.int32)[keep]
         for par in (0, 1):   # 隣どうしは重なるので偶奇に分ける(fillPoly は重なりを穴にする)
-            cv2.fillPoly(lay, list(tri[par::2]), _scale(col, 0.82 * k), AA)
+            cv2.fillPoly(lay, list(tri[par::2]), _scale(col, 0.65 * k), AA)
     # 火の粉(状態なし: 時刻から位置を決める)
-    for i in range(40):
+    for i in range(28):
         rate = 0.9 + (i * 37 % 11) / 10
         f = (now * rate + i * 0.618) % 1.0
         th = i * 2.399 + 0.25 * math.sin(now * 2 + i)
+        if cover is not None:
+            a0, a1, fill = cover
+            if fill < 0.5 and (th - a0) % (2 * math.pi) > a1 - a0:
+                continue
         r = r0 + (20 + f * 90) * S
         col = (60, int(200 - 140 * f), 255) if f < 0.5 else (20, int(120 - 100 * f), int(255 - 120 * f))
         cv2.circle(lay, (int(ox + math.cos(th) * r), int(oy + math.sin(th) * r)), max(1, int(2 * (1 - f))),
                    _scale(col, k), -1, AA)
-    glow = cv2.GaussianBlur(cv2.resize(lay, (lay.shape[1] // 2, lay.shape[0] // 2), interpolation=cv2.INTER_AREA),
-                            (0, 0), 3)
-    lay = cv2.addWeighted(lay, 1.0, cv2.resize(glow, (lay.shape[1], lay.shape[0]), interpolation=cv2.INTER_LINEAR),
-                          0.6, 0)
+    if glow is not None:       # 龍と共通のグロー層へ(まとめてぼかして加算する)
+        gx0, gy0 = int(x0 * gs), int(y0 * gs)
+        gw, gh = min(glow.shape[1] - gx0, int((x1 - x0) * gs)), min(glow.shape[0] - gy0, int((y1 - y0) * gs))
+        sub = glow[gy0:gy0 + gh, gx0:gx0 + gw]
+        cv2.add(sub, cv2.resize(lay, (gw, gh), interpolation=cv2.INTER_AREA), dst=sub)
+    else:
+        g = cv2.GaussianBlur(cv2.resize(lay, (lay.shape[1] // 2, lay.shape[0] // 2), interpolation=cv2.INTER_AREA),
+                             (0, 0), 3)
+        lay = cv2.addWeighted(lay, 1.0, cv2.resize(g, (lay.shape[1], lay.shape[0]), interpolation=cv2.INTER_LINEAR),
+                              0.6, 0)
     up = cv2.resize(lay, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
     roi = frame[y0:y1, x0:x1]
     cv2.add(roi, up, dst=roi)
 
 
-def _draw_bonus_telop(frame, w, h, center, t):
+def _draw_bonus_telop(frame, w, h, center, t, shake=(0, 0)):
     """右側の大テロップ: DOUBLE / ×2 / SCORE x2 5 SEC。"""
     if not 0 <= t < DRAGON_T + 0.4:
         return
     a = 1.0 if t < DRAGON_T - 0.1 else max(0.0, (DRAGON_T + 0.4 - t) / 0.5)
-    cx = w - 118          # 龍の軌道(外周 r≈390 + 頭)と重ならないよう右端寄せ
+    cx = w - 118 + shake[0]   # 龍の軌道(外周 r≈390 + 頭)と重ならないよう右端寄せ
     pop = 1 + 0.8 * math.exp(-t * 9) * abs(math.cos(t * 15))
-    _text_center(frame, "DOUBLE", cx, h * 0.32, DUPLEX, 1.3, _scale(INK, a), 9)
-    _text_center(frame, "DOUBLE", cx, h * 0.32, DUPLEX, 1.3, _scale(D_GOLD, a), 3)
+    sy = shake[1]
+    _text_center(frame, "DOUBLE", cx, h * 0.32 + sy, DUPLEX, 1.3, _scale(INK, a), 9)
+    _text_center(frame, "DOUBLE", cx, h * 0.32 + sy, DUPLEX, 1.3, _scale(D_GOLD, a), 3)
     m, e = _small_mask("×2", 130)
     rows = np.arange(m.shape[0], dtype=np.float32) / m.shape[0]
     grad = np.stack([20 + 25 * (1 - rows), 50 + 190 * (1 - rows), 240 + 15 * (1 - rows)], 1)    # 黄→赤
     flick = 0.92 + 0.08 * math.sin(t * 30)
     fill = (grad[:, None, :] * a * flick).clip(0, 255).astype(np.uint8)
-    _paste_mask(frame, m, e, cx + 4 * math.sin(t * 37), h * 0.5, pop, fill, (0, 0, 0))
-    _text_center(frame, "SCORE x2  5 SEC", cx, h * 0.68, DUPLEX, 0.58, _scale(INK, a), 6)
-    _text_center(frame, "SCORE x2  5 SEC", cx, h * 0.68, DUPLEX, 0.58, _scale((235, 235, 235), a), 1)
+    _paste_mask(frame, m, e, cx + 4 * math.sin(t * 37), h * 0.5 + sy, pop, fill, (0, 0, 0))
+    _text_center(frame, "SCORE x2  5 SEC", cx, h * 0.68 + sy, DUPLEX, 0.58, _scale(INK, a), 6)
+    _text_center(frame, "SCORE x2  5 SEC", cx, h * 0.68 + sy, DUPLEX, 0.58, _scale((235, 235, 235), a), 1)
 
 
 def _draw_bonus_bar(frame, w, h, center, radii, now, bonus_start, bonus_until):
@@ -1087,18 +1414,25 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
     if bull:
         hit, age, streak = bull
         if fever:
-            # 龍が出ている間(発動直後の別のブルも含む)は、バーストと大当たり文字を省く(描画時間・輝度対策)
-            trig = bonus and (abs(hit.t - bonus_start) < 0.5 or intro)
+            # 2倍タイム中は龍が舞っているので、バースト・大当たり文字・紙吹雪を省く(描画時間・輝度対策)
+            trig = bonus
             _draw_fever_outer(frame, w, h, center, radii, hit, age, streak, dragon=trig, fire=bonus)
         else:
             _draw_rays(frame, center, age)
             _draw_confetti(frame, center, radii, hit, age)
             _draw_telop(frame, w, h, center, radii, age, streak)
-    if bonus:   # 炎は加算なので、バーストの後に重ねる
-        _draw_fire_ring(frame, center, now, _bonus_level(now, bonus_start, bonus_until))
-    if intro:
-        _draw_bonus_telop(frame, w, h, center, now - bonus_start)
-        _draw_dragon(frame, center, now - bonus_start)
+    if bonus:   # 炎は加算なので、バーストの後に重ねる。龍は bonus_until まで舞い、終了前に去る
+        tb, total = now - bonus_start, bonus_until - bonus_start
+        glow = np.zeros((h // 4, w // 4, 3), np.uint8)   # 龍・炎・宝珠・稲妻の共通グロー(1/4 解像度)
+        _draw_fire_ring(frame, center, now, _bonus_level(now, bonus_start, bonus_until), _fire_cover(tb, total),
+                        glow, 0.25)
+        shake = _shake(tb) if intro else (0, 0)
+        ca = min(1.0, tb / 0.5) * min(1.0, max(0.0, (total - tb) / 0.8))
+        _draw_clouds(frame, tb, ca, shake)
+        if intro:
+            _draw_bonus_telop(frame, w, h, center, tb, shake)
+            _draw_seal(frame, tb, shake)
+        _draw_dragons(frame, center, tb, total, intro, int(bonus_start * 10) & 0xFFFF, glow)
     if outer:
         frame[box[1]:box[3] + 1, box[0]:box[2] + 1] = base[box[1]:box[3] + 1, box[0]:box[2] + 1]
     reel = bull[1] if (fever and bull and bull[0] is hits[-1]) else None
