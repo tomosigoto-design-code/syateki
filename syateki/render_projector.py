@@ -658,14 +658,14 @@ def _draw_sunburst(frame, center, age, wedges=True):
                      col, 2 if i % 3 else 3, AA)
 
 
-def _draw_stars(frame, center, hit, age):
+def _draw_stars(frame, center, hit, age, n=60):
     """星のきらめき(4本のとげの星が瞬く)。円の外の固定位置。"""
     a = _fever_fade(age)
     rng = np.random.default_rng((int(hit.t * 1000) + 7) & 0xFFFFFFFF)
     h, w = frame.shape[:2]
     pts = rng.uniform((0, 0), (w, h), (160, 2))
     d = np.hypot(pts[:, 0] - center[0], pts[:, 1] - center[1])
-    pts = pts[d > QUIET_R + 20][:60]
+    pts = pts[d > QUIET_R + 20][:n]
     ph = rng.uniform(0, 6.3, len(pts))
     om = rng.uniform(7, 14, len(pts))
     sz = rng.uniform(6, 15, len(pts))
@@ -695,11 +695,11 @@ def _draw_rain(frame, hit, age):
     _draw_flakes(frame, rng, xs, ys, age, RAINBOW, a)
 
 
-def _draw_marquee(frame, age):
+def _draw_marquee(frame, age, step=30):
     """画面外周の電飾(色が流れて、チカチカ点滅する)。"""
     a = _fever_fade(age)
     h, w = frame.shape[:2]
-    m, step = 13, 30
+    m = 13
     pts = [(x, m) for x in range(m, w - m, step)] + [(w - m, y) for y in range(m, h - m, step)] + \
           [(x, h - m) for x in range(w - m, m, -step)] + [(m, y) for y in range(h - m, m, -step)]
     tick = int(age * 16)
@@ -789,12 +789,12 @@ def _draw_fever_outer(frame, w, h, center, radii, hit, age, streak, dragon=False
     """dragon=True(2倍タイムの発動中)は龍とテロップが主役なので、バーストと大当たり文字を省く。"""
     if not dragon:
         _draw_sunburst(frame, center, age, wedges=not fire)   # 炎と重なるときは帯を省く(平均輝度対策)
-    _draw_stars(frame, center, hit, age)
-    _draw_confetti(frame, center, radii, hit, age, n=90 if dragon else (140 if fire else 200),
+    _draw_stars(frame, center, hit, age, n=30 if dragon else 60)
+    _draw_confetti(frame, center, radii, hit, age, n=70 if dragon else (140 if fire else 200),
                    palette=RAINBOW, a=_fever_fade(age), seed=11)
     if not dragon:
         _draw_rain(frame, hit, age)
-    _draw_marquee(frame, age)
+    _draw_marquee(frame, age, step=40 if dragon else 30)
     if not dragon:
         _draw_fever_telops(frame, w, h, center, age, streak)
         _draw_jackpot(frame, w, h, center, age)
@@ -849,9 +849,11 @@ def _draw_dragon(frame, center, t):
     base = Q[ks] + Nn * (width[ks] * 0.5)[:, None]
     tip = Q[ks] + Nn * (width[ks] + fl)[:, None] - T * 14
     fins = np.stack([base + T * 9, tip, base - T * 11], 1)
-    cv2.fillPoly(frame, list(i32(fins)), D_RED_DK, AA)
     inner = np.stack([fins[:, 0], (fins[:, 0] + fins[:, 1]) / 2, fins[:, 2]], 1)
     gold = ks % 4 == 0
+    for par in (0, 1):   # 隣どうしは重なるので偶奇に分ける(fillPoly は重なりを穴にする)
+        sel = (np.arange(len(ks)) % 2) == par
+        cv2.fillPoly(frame, list(i32(fins[sel])), D_RED_DK, AA)
     cv2.fillPoly(frame, list(i32(inner[gold])), D_GOLD, AA)
     cv2.fillPoly(frame, list(i32(inner[~gold])), D_RED, AA)
     # 脚(腹側に2対、金の爪)
@@ -983,21 +985,21 @@ def _draw_fire_ring(frame, center, now, k):
     M = 46
     r0 = (QUIET_R + 2) * S
     layers = (((20, 30, 170), 1.0, 0.8), ((10, 110, 250), 0.66, 0.58), ((120, 230, 255), 0.34, 0.36))
-    for i in range(M):
-        th = i * 2 * math.pi / M + 0.03 * math.sin(now * 3 + i)
-        L = 34 + 26 * (0.5 * math.sin(now * 7.3 + i * 1.7) + 0.3 * math.sin(now * 11.9 + i * 0.83)
-                       + 0.2 * math.sin(now * 4.1 + i * 2.9))
-        L *= (0.55 + 0.45 * k) * S
-        sway = 0.11 * math.sin(now * 9 + i * 1.3) + 0.05 * math.sin(now * 17 + i * 0.7)
-        c0, s0 = math.cos(th), math.sin(th)
-        ct, st_ = math.cos(th + sway), math.sin(th + sway)
-        for col, sl, sw in layers:
-            hw = sw * 2 * math.pi / M
-            tip_r = r0 + L * sl
-            pts = np.array([[ox + math.cos(th - hw) * r0, oy + math.sin(th - hw) * r0],
-                            [ox + ct * tip_r, oy + st_ * tip_r],
-                            [ox + math.cos(th + hw) * r0, oy + math.sin(th + hw) * r0]], np.int32)
-            cv2.fillConvexPoly(lay, pts, _scale(col, 0.82 * k), AA)
+    i = np.arange(M)
+    th = i * 2 * math.pi / M + 0.03 * np.sin(now * 3 + i)
+    L = 34 + 26 * (0.5 * np.sin(now * 7.3 + i * 1.7) + 0.3 * np.sin(now * 11.9 + i * 0.83)
+                   + 0.2 * np.sin(now * 4.1 + i * 2.9))
+    L = L * (0.55 + 0.45 * k) * S
+    tip_th = th + 0.11 * np.sin(now * 9 + i * 1.3) + 0.05 * np.sin(now * 17 + i * 0.7)
+    for col, sl, sw in layers:              # 赤(長い) → 橙 → 黄(短い芯) の順に重ねる
+        hw = sw * 2 * math.pi / M
+        tip_r = r0 + L * sl
+        tri = np.stack([np.stack([ox + np.cos(th - hw) * r0, oy + np.sin(th - hw) * r0], 1),
+                        np.stack([ox + np.cos(tip_th) * tip_r, oy + np.sin(tip_th) * tip_r], 1),
+                        np.stack([ox + np.cos(th + hw) * r0, oy + np.sin(th + hw) * r0], 1)], 1)
+        tri = np.round(tri).astype(np.int32)
+        for par in (0, 1):   # 隣どうしは重なるので偶奇に分ける(fillPoly は重なりを穴にする)
+            cv2.fillPoly(lay, list(tri[par::2]), _scale(col, 0.82 * k), AA)
     # 火の粉(状態なし: 時刻から位置を決める)
     for i in range(40):
         rate = 0.9 + (i * 37 % 11) / 10
@@ -1085,8 +1087,8 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
     if bull:
         hit, age, streak = bull
         if fever:
-            # 2倍タイムを発動させたブルは、龍とテロップが主役(バーストと大当たり文字は出さない)
-            trig = bonus and abs(hit.t - bonus_start) < 0.5
+            # 龍が出ている間(発動直後の別のブルも含む)は、バーストと大当たり文字を省く(描画時間・輝度対策)
+            trig = bonus and (abs(hit.t - bonus_start) < 0.5 or intro)
             _draw_fever_outer(frame, w, h, center, radii, hit, age, streak, dragon=trig, fire=bonus)
         else:
             _draw_rays(frame, center, age)
