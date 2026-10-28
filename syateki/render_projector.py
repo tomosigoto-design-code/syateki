@@ -37,7 +37,6 @@ BOARD_CREAM = (190, 222, 234)
 BOARD_RED = (48, 42, 196)
 BOARD_GREEN = (70, 132, 32)
 WIRE = (172, 174, 176)
-NUMBER = (236, 236, 236)
 WHITE = (255, 255, 255)
 INK = (12, 12, 12)
 BAR_DARK = (22, 22, 23)
@@ -47,8 +46,6 @@ READY_GREEN = (90, 190, 70)
 
 # キャリブ用の四隅マーカー色(変更禁止)
 CORNER_COLORS = [(0, 0, 255), (0, 255, 0), (255, 140, 0), (0, 255, 255)]
-
-BOARD_NUMBERS = (20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5)
 
 QUIET_R = 300        # この半径以内は命中演出以外を静止させる
 FX_END = 0.8         # 命中演出が完全に消える時刻(秒)。0.85 未満
@@ -60,18 +57,13 @@ _static_cache: dict = {}
 
 # ---------------------------------------------------------------- geometry
 def _board_rings(radii):
-    """ボードの帯の半径。得点境界 (r100, r50, r10) に帯の外周を合わせる。"""
+    """的の各リングの半径。色の境界を得点境界 (r100, r50, r10) に合わせる。"""
     r100, r50, r10 = radii
-    band = max(6, round(r10 * 0.05))
     return {
-        "bull": round(r100 * 0.4),       # 赤いブル
-        "outer_bull": r100,              # 緑のアウターブル = 100点の境界
-        "treble_in": r50 - band,         # トリプル風の帯の外周 = 50点の境界
-        "treble_out": r50,
-        "double_in": r10 - band,         # ダブル風の帯の外周 = 10点の境界
-        "double_out": r10,
-        "number": r10 + round(r10 * 0.088),  # 数字の中心
-        "edge": r10 + round(r10 * 0.18),     # ボードの外周
+        "bull": r100,                        # 赤(100点)
+        "middle": r50,                       # 緑(50点)
+        "outer": r10,                        # クリーム(10点)
+        "edge": r10 + round(r10 * 0.1),      # 黒い外周リングの外側
     }
 
 
@@ -91,64 +83,36 @@ def _bar_rect(w, h, center, radii):
 
 # ---------------------------------------------------------------- static
 def _draw_board(size, cx, cy, radii):
-    """ボード(数字リングまで)を SS 倍で描いて縮小した (img, alpha) を返す。"""
+    """3重リングの的(外=クリーム、中=緑、ブル=赤に黒縁)を SS 倍で描いて縮小した (img, alpha) を返す。"""
     R = _board_rings(radii)
     S = SS
     big = np.zeros((size * S, size * S, 3), np.uint8)
     alpha = np.zeros((size * S, size * S), np.uint8)
     c = (cx * S, cy * S)
 
-    def pie(r, a0, a1, col):
-        cv2.ellipse(big, c, (r * S, r * S), 0, a0, a1, col, -1, AA)
-
     cv2.circle(big, c, R["edge"] * S, BOARD_BLACK, -1, AA)
     cv2.circle(alpha, c, R["edge"] * S, 255, -1, AA)
-    for i in range(20):
-        a0, a1 = -99 + 18 * i, -81 + 18 * i
-        single = BOARD_BLACK if i % 2 == 0 else BOARD_CREAM
-        ring = BOARD_RED if i % 2 == 0 else BOARD_GREEN
-        pie(R["double_out"], a0, a1, ring)
-        pie(R["double_in"], a0, a1, single)
-        pie(R["treble_out"], a0, a1, ring)
-        pie(R["treble_in"], a0, a1, single)
-    cv2.circle(big, c, R["outer_bull"] * S, BOARD_GREEN, -1, AA)
+    cv2.circle(big, c, R["outer"] * S, BOARD_CREAM, -1, AA)
+    cv2.circle(big, c, R["middle"] * S, BOARD_GREEN, -1, AA)
     cv2.circle(big, c, R["bull"] * S, BOARD_RED, -1, AA)
 
-    # 銀のワイヤー
-    wt = S  # 縮小後 1px
-    for i in range(20):
-        a = math.radians(-99 + 18 * i)
-        p0 = (round(c[0] + math.cos(a) * R["outer_bull"] * S), round(c[1] + math.sin(a) * R["outer_bull"] * S))
-        p1 = (round(c[0] + math.cos(a) * R["double_out"] * S), round(c[1] + math.sin(a) * R["double_out"] * S))
-        cv2.line(big, p0, p1, WIRE, wt, AA)
-    for k in ("bull", "outer_bull", "treble_in", "treble_out", "double_in", "double_out"):
-        cv2.circle(big, c, R[k] * S, WIRE, wt, AA)
-    cv2.circle(big, c, (R["edge"] - 2) * S, (58, 58, 60), wt, AA)
-
-    # 数字リング
-    for i, n in enumerate(BOARD_NUMBERS):
-        a = math.radians(-90 + 18 * i)
-        x = c[0] + math.cos(a) * R["number"] * S
-        y = c[1] + math.sin(a) * R["number"] * S
-        _text_center(big, str(n), x, y, DUPLEX, 0.62 * S, NUMBER, S)
+    # 境界線: ブルは黒縁、中間の外周は黒の細線、外周は銀のワイヤー
+    cv2.circle(big, c, R["bull"] * S, BOARD_BLACK, 3 * S, AA)
+    cv2.circle(big, c, R["middle"] * S, BOARD_BLACK, 2 * S, AA)
+    cv2.circle(big, c, R["outer"] * S, WIRE, S, AA)
+    cv2.circle(big, c, (R["edge"] - 2) * S, (58, 58, 60), S, AA)
 
     img = cv2.resize(big, (size, size), interpolation=cv2.INTER_AREA)
     alpha = cv2.resize(alpha, (size, size), interpolation=cv2.INTER_AREA)
     return img, alpha
 
 
-def _band_icon(img, cx, cy, radii, zone):
-    """得点帯の説明用の小さな的。zone の帯だけ白く塗る。"""
-    r100, r50, r10 = radii
-    k = 13 / r10
-    rr = [max(2, round(r * k)) for r in (r100, r50, r10)]
-    if zone == 0:
-        cv2.circle(img, (cx, cy), rr[0], WHITE, -1, AA)
-    else:
-        cv2.circle(img, (cx, cy), rr[zone], WHITE, -1, AA)
-        cv2.circle(img, (cx, cy), rr[zone - 1], BAR_DARK, -1, AA)
-    for r in rr:
-        cv2.circle(img, (cx, cy), r, (110, 110, 112), 1, AA)
+
+def _band_icon(img, cx, cy, zone):
+    """得点の説明用の色見本(的と同じ色の小さな円)。"""
+    col = (BOARD_RED, BOARD_GREEN, BOARD_CREAM)[zone]
+    cv2.circle(img, (cx, cy), 8, col, -1, AA)
+    cv2.circle(img, (cx, cy), 8, (90, 90, 92), 1, AA)
 
 
 def _build_static(w, h, center, radii):
@@ -188,13 +152,13 @@ def _build_static(w, h, center, radii):
     cv2.putText(bg, "LAST", (mid + 8, by0 + 97), SIMPLEX, 0.36, LABEL, 1, AA)
     cv2.line(bg, (mid, by0 + 88), (mid, by0 + 118), (58, 58, 60), 1)
 
-    # 得点の説明(帯の小さな図 + 点数)
+    # 得点の説明(色見本 + 点数)
     ky = by1 + 34
     step = (bx1 - bx0) // 3
     for i, (zone, pts) in enumerate(((0, "100"), (1, "50"), (2, "10"))):
         kx = bx0 + 16 + i * step
-        _band_icon(bg, kx + 13, ky, radii, zone)
-        cv2.putText(bg, pts, (kx + 32, ky + 6), SIMPLEX, 0.45, (200, 200, 200), 1, AA)
+        _band_icon(bg, kx + 9, ky, zone)
+        cv2.putText(bg, pts, (kx + 24, ky + 6), SIMPLEX, 0.45, (200, 200, 200), 1, AA)
 
     _draw_corners(bg, w, h)
     _text_center(bg, "C: AUTO ALIGN   /   RIGHT CLICK: RESET   /   F: FULLSCREEN",
