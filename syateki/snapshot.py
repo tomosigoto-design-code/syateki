@@ -81,6 +81,22 @@ def write_all(outdir):
                                                config.CORNER_LABELS, config.CORNER_COLORS,
                                                settled=settled, mode="fever")
 
+    # 自動キャリブ (C): 投影するマーカー画面と、斜め・明るい会場で撮った体の監視画面
+    from .aruco_calib import calib_screen, detect_markers
+    screen = calib_screen()
+    shots["10_calib_aruco"] = screen
+    quad = np.float32([(110, 80), (540, 95), (565, 405), (85, 390)])
+    m = cv2.getPerspectiveTransform(
+        np.float32([[0, 0], [config.PROJ_W, 0], [config.PROJ_W, config.PROJ_H], [0, config.PROJ_H]]), quad)
+    seen = cam.copy()
+    inside = cv2.warpPerspective(np.full(screen.shape[:2], 255, np.uint8), m, seen.shape[1::-1]) > 0
+    seen[inside] = cv2.warpPerspective(screen, m, seen.shape[1::-1])[inside]
+    seen = cv2.convertScaleAbs(seen, alpha=0.35, beta=150)  # 明るい会場: 白とマーカーの差が小さい
+    found = detect_markers(seen)
+    shots["11_monitor_calib_aruco"] = render_monitor(
+        seen, corners, 1, -1, None, None, config.CORNER_LABELS, config.CORNER_COLORS,
+        calib_status=f"AUTO ALIGN: MARKERS {len(found)}/4", calib_markers=found)
+
     paths = []
     for name, img in shots.items():
         p = os.path.abspath(os.path.join(outdir, name + ".png"))

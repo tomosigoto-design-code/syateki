@@ -233,7 +233,8 @@ def test_buttons_and_click4(tmp_path):
     assert app.click_step == -1 and json.loads(p.read_text()) == pts
     x1, y1, x2, y2 = BUTTONS["auto"]
     app.on_camera_mouse(cv2.EVENT_LBUTTONDOWN, x1 + 2, y1 + 2, 0)
-    assert app.calib_step == 1
+    from syateki.app import CALIB_ARUCO
+    assert app.calib_step == CALIB_ARUCO
 
 
 def test_demo_click_scores(tmp_path):
@@ -250,34 +251,101 @@ def test_demo_click_scores(tmp_path):
     assert app.game.total_score == 0
 
 
-def test_auto_calibration_flow(tmp_path, monkeypatch):
+def _calib_app(tmp_path, monkeypatch):
     from syateki import app as app_mod
     app, p = make_app(tmp_path)
-    cam = np.full((480, 640, 3), 30, np.uint8)
-    quad = [(100, 70), (540, 80), (560, 410), (90, 400)]
-    lit = cam.copy()
-    cv2.fillPoly(lit, [np.int32(quad)], (230, 230, 230))
-    showing = lit.copy()  # 派手な演出がまだ写っているカメラ画像 (暗フレームに使ってはいけない)
-
     calls = []
     real = app_mod.render_projector
     monkeypatch.setattr(app_mod, "render_projector",
                         lambda *a, **kw: calls.append(1) or real(*a, **kw))
+    return app, p, calls
+
+
+def test_auto_calibration_aruco(tmp_path, monkeypatch):
+    """マーカー画面を出し、0.2秒後から検出。4個見えたフレームが溜まったら確定。"""
+    from syateki import app as app_mod
+    from test_aruco import QUADS, camera_view
+    app, p, calls = _calib_app(tmp_path, monkeypatch)
+    quad = QUADS[0]
+    cam = camera_view(quad)                    # 明るい会場で斜めから撮った体
     app.start_auto_calibration(now=0.0)
-    for t in (0.0, 0.1, 0.19):                  # 投影は真っ黒、まだ暗フレームは撮らない
-        proj, _ = app.step(showing, t)
+    proj, _ = app.step(cam, 0.1)               # 遅延待ち: まだ検出しない
+    assert app.calib_step == app_mod.CALIB_ARUCO and not app.markers.counts
+    assert not calls and proj.min() == 0 and proj.mean() > 200   # 白地 + 黒いマーカー
+    t = config.ARUCO_WAIT_SEC
+    for i in range(config.ARUCO_GOOD_FRAMES - 1):
+        _, mon = app.step(cam, t + 0.03 * i)
+        assert app.calib_step == app_mod.CALIB_ARUCO and len(app.seen_markers) == 4
+    app.step(cam, t + 0.1)
+    assert app.calib_step == app_mod.CALIB_IDLE
+    for (fx, fy), (qx, qy) in zip(app.corners, quad):
+        assert abs(fx - qx) <= 3 and abs(fy - qy) <= 3
+    assert json.loads(p.read_text()) == app.corners
+    assert app.calib_note[0].startswith("AUTO ALIGN OK (ARUCO 4/4)")
+    # 直後はキャリブ画面の残像が写るので、少しの間は背景を撮り直し続けて検出しない
+    app.step(cam, t + 0.15)
+    assert app.tracker.seen == 0 and app.game.total_score == 0
+
+
+def test_auto_calibration_aruco_two_hidden_uses_partial_on_timeout(tmp_path, monkeypatch):
+    from syateki import app as app_mod
+    from test_aruco import QUADS, camera_view
+    app, _, _ = _calib_app(tmp_path, monkeypatch)
+    quad = QUADS[0]
+    cam = camera_view(quad, hide=(1, 3))
+    app.start_auto_calibration(now=0.0)
+    t = config.ARUCO_WAIT_SEC
+    while app.calib_step == app_mod.CALIB_ARUCO:
+        app.step(cam, t)
+        t += 0.1
+    assert t <= config.ARUCO_WAIT_SEC + config.ARUCO_TIMEOUT_SEC + 0.2
+    assert app.calib_note[0] == "AUTO ALIGN OK (ARUCO 2/4)"
+    for (fx, fy), (qx, qy) in zip(app.corners, quad):
+        assert abs(fx - qx) <= 4 and abs(fy - qy) <= 4
+
+
+def test_auto_calibration_falls_back_to_flash(tmp_path, monkeypatch):
+    """マーカーが1個も見えなければ、2秒後に 黒 → 白フラッシュ方式へ。"""
+    from syateki import app as app_mod
+    app, p, calls = _calib_app(tmp_path, monkeypatch)
+    cam = np.full((480, 640, 3), 30, np.uint8)
+    quad = [(100, 70), (540, 80), (560, 410), (90, 400)]
+    lit = cam.copy()
+    cv2.fillPoly(lit, [np.int32(quad)], (230, 230, 230))
+
+    app.start_auto_calibration(now=0.0)
+    t_fb = config.ARUCO_WAIT_SEC + config.ARUCO_TIMEOUT_SEC
+    for t in np.arange(0.0, t_fb, 0.25):
+        app.step(lit, float(t))
+        assert app.calib_step == app_mod.CALIB_ARUCO
+    _, mon = app.step(lit, t_fb)
+    assert app.calib_step == app_mod.CALIB_DARK and app.dark_gray is None
+    for dt in (0.0, 0.1, 0.19):                 # 投影は真っ黒、まだ暗フレームは撮らない
+        proj, _ = app.step(lit, t_fb + dt)
         assert app.calib_step == app_mod.CALIB_DARK and proj.max() == 0 and not calls
-    assert app.dark_gray is None
-    proj, _ = app.step(cam, config.DARK_WAIT_SEC)  # 待った後に暗フレーム → 白点灯
+    t1 = t_fb + config.DARK_WAIT_SEC
+    proj, _ = app.step(cam, t1)                 # 暗フレーム → 白点灯
     assert app.calib_step == app_mod.CALIB_FLASH and proj.mean() > 250
-    t1 = config.DARK_WAIT_SEC
-    proj, _ = app.step(cam, t1 + 0.1)           # 白点灯中 (露出待ち)
-    assert proj.mean() > 250
     app.step(lit, t1 + config.FLASH_WAIT_SEC + 0.05)
-    assert app.calib_step == 0
+    assert app.calib_step == app_mod.CALIB_IDLE
     for (fx, fy), (qx, qy) in zip(app.corners, quad):
         assert abs(fx - qx) <= 6 and abs(fy - qy) <= 6
     assert json.loads(p.read_text()) == app.corners
+    assert app.calib_note[0] == "AUTO ALIGN OK (FLASH)"
+
+
+def test_auto_calibration_both_fail(tmp_path, monkeypatch):
+    app, p, _ = _calib_app(tmp_path, monkeypatch)
+    before = json.loads(p.read_text())
+    cam = np.full((480, 640, 3), 30, np.uint8)  # 何も写らない
+    app.start_auto_calibration(now=0.0)
+    t = 0.0
+    while app.calib_step != 0 and t < 5:
+        _, mon = app.step(cam, t)
+        t += 0.1
+    assert app.calib_step == 0 and app.corners == before == json.loads(p.read_text())
+    assert app.calib_note[0].startswith("AUTO ALIGN FAILED")
+    assert app._calib_status(t) is not None and app._calib_status(t + 10) is None
 
 
 # ---------------------------------------------------------------- 演出モード

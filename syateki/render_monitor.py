@@ -195,7 +195,8 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
                    corner_labels: list[str], corner_colors: list[tuple],
                    settled=None, tracking_frames: int = 0,
                    offset: tuple[int, int] = (0, 0), offset_step: int = 0,
-                   mode: str = "normal", bonus_left: float = 0.0) -> np.ndarray:
+                   mode: str = "normal", bonus_left: float = 0.0,
+                   calib_status: str | None = None, calib_markers=None) -> np.ndarray:
     """カメラ監視画面を描画した BGR 画像を返す（入力は書き換えない）
 
     click_step: -1 なら通常表示。0〜3 なら「次に [n] をクリック」ガイドを表示
@@ -205,6 +206,8 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
     offset_step: 1 = 補正モードで着弾待ち、2 = 投影画面のクリック待ち
     mode: 演出モード ("normal" / "fever")。ガイド帯に出す
     bonus_left: ボーナスタイム (スコア2倍) の残り秒。0 より大きければガイド帯に出す
+    calib_status: 自動キャリブの状況 (例 "AUTO ALIGN: MARKERS 3/4")。ガイド帯に強調して出す
+    calib_markers: 見えている ArUco マーカー {id: (4, 2) カメラ座標}。枠と id を描く
     """
     img = cv2.cvtColor(cam_frame, cv2.COLOR_GRAY2BGR) if cam_frame.ndim == 2 else cam_frame.copy()
     h, w = img.shape[:2]
@@ -237,6 +240,15 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
             _darken_roi(img, px, ty - tht - 3, px + tw + 6, ty + base + 2, 0.7)
             cv2.putText(img, status, (px + 3, ty), FONT_S, ss, scol, 1, AA)
 
+    # 検出した ArUco マーカー (drawDetectedMarkers 相当)
+    for mid, quad in (calib_markers or {}).items():
+        q = np.int32(np.round(quad)).reshape(-1, 1, 2)
+        cv2.polylines(img, [q], True, (0, 255, 0), 2, AA)
+        cv2.rectangle(img, tuple(int(v) - 3 for v in quad[0]), tuple(int(v) + 3 for v in quad[0]),
+                      (0, 0, 255), -1)
+        cx, cy = np.mean(quad, axis=0)
+        _text_center(img, f"id{mid}", cx, cy, FONT, 0.5 * ui, (0, 0, 255), 2)
+
     # 四隅ハンドル（プレビューより前面）
     for i, pt in enumerate(corners):
         _draw_corner(img, pt, corner_colors[i % len(corner_colors)], corner_labels[i % len(corner_labels)],
@@ -244,8 +256,12 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
 
     # 下部ガイド帯
     ofs = f"OFFSET {offset[0]:+d},{offset[1]:+d}"
-    emph = clicking or offset_step in (1, 2)  # ガイド帯を強調する
-    if clicking:
+    emph = clicking or offset_step in (1, 2) or bool(calib_status)  # ガイド帯を強調する
+    if calib_status and not clicking:
+        line1 = f">> {calib_status} <<"
+        line2 = "C: retry  /  M: click 4 corners  /  Drag, Arrows,WASD: fine-tune"
+        c1, c2 = GUIDE_HI, (255, 255, 255)
+    elif clicking:
         lab = corner_labels[click_step % len(corner_labels)]
         line1 = f">> CLICK {lab} CORNER <<"
         line2 = f"step {click_step + 1}/4  -  click the projected corner on this view"

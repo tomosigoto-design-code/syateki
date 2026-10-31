@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from . import config
+from .aruco_calib import MarkerAverager, calib_screen, corners_from_markers, detect_markers
 from .calibration import detect_projection_corners, load_corners, save_corners
 from .detector import HitTracker, find_hit, score_for_point, warp_to_projector
 from .game import COOLDOWN, GameState
@@ -19,7 +20,9 @@ from . import sound
 WIN_CAM = "Camera Monitor (Control)"
 WIN_PROJ = "Projector View (Target)"
 
-CALIB_IDLE, CALIB_DARK, CALIB_FLASH = 0, 1, 2
+# C キー: ArUco マーカー → (だめなら) 黒 → 白フラッシュ
+CALIB_IDLE, CALIB_DARK, CALIB_FLASH, CALIB_ARUCO = 0, 1, 2, 3
+NOTE_SEC = 3.0  # キャリブ結果を監視画面に出しておく秒数
 # O キーのワンクリック補正: 待機 → 着弾待ち → 投影画面のクリック待ち
 OFS_IDLE, OFS_WAIT_SHOT, OFS_WAIT_CLICK = 0, 1, 2
 
@@ -64,6 +67,10 @@ class App:
         self.calib_step = CALIB_IDLE
         self.calib_start = 0.0
         self.dark_gray = None
+        self.markers = MarkerAverager()
+        self.seen_markers = {}    # 直近フレームで見えたマーカー (監視画面の表示用)
+        self.calib_note = None    # (文言, 表示を終える時刻)
+        self.bg_settle_until = 0.0  # この時刻までは背景を撮り続け、検出しない (キャリブ画面の残像対策)
         self.bg_gray = None
         self.game = GameState()
         self.fullscreen = False
@@ -84,11 +91,14 @@ class App:
 
     def start_auto_calibration(self, now=None):
         self.click_step = -1
-        self.calib_step = CALIB_DARK
+        self.calib_step = CALIB_ARUCO
         self.calib_start = time.time() if now is None else now
         self.dark_gray = None
+        self.markers = MarkerAverager()
+        self.seen_markers = {}
+        self.calib_note = None
         sound.play("calib_start")
-        print("★ 四隅の自動認識キャリブレーションを開始します (プロジェクターが一瞬光ります)")
+        print("★ 四隅の自動認識を開始します (マーカーを投影。だめならフラッシュ方式)")
 
     def start_click_mode(self):
         self.click_step = 0
@@ -258,23 +268,52 @@ class App:
         return _call_projector(args, mode=self.mode, bonus_start=self.game.bonus_start,
                                bonus_until=self.game.bonus_until)
 
+    def _finish_calibration(self, found, how, now):
+        if found is not None:
+            self.corners = found
+            self.save()
+            sound.play("calib_ok")
+            print(f"★ 成功 ({how}): プロジェクターの四つ角を認識しました {self.corners}")
+            self.calib_note = (f"AUTO ALIGN OK ({how})", now + NOTE_SEC)
+        else:
+            print("★ 四隅を認識できませんでした (設定は変えていません。M で4点クリック設定も可)")
+            self.calib_note = ("AUTO ALIGN FAILED - try M: CLICK 4", now + NOTE_SEC)
+        self.calib_step = CALIB_IDLE
+        self.seen_markers = {}
+        self.reset_game(quiet=True)
+        self.bg_settle_until = now + config.ARUCO_WAIT_SEC * 2
+
+    def _aruco_step(self, cam_gray, now):
+        """マーカーを探して溜める。十分溜まるか時間切れで四隅を出す。だめならフラッシュ方式へ。"""
+        if now - self.calib_start < config.ARUCO_WAIT_SEC:
+            return
+        self.seen_markers = detect_markers(cam_gray)
+        if len(self.seen_markers) >= config.ARUCO_MIN_MARKERS:
+            self.markers.add(self.seen_markers)
+        enough = self.markers.full_frames >= config.ARUCO_GOOD_FRAMES
+        if not enough and now - self.calib_start < config.ARUCO_WAIT_SEC + config.ARUCO_TIMEOUT_SEC:
+            return
+        found = corners_from_markers(self.markers.mean()) if self.markers.counts else None
+        if found is not None:
+            n = len(self.markers.counts)
+            self._finish_calibration(found, f"ARUCO {n}/4", now)
+            return
+        print("★ マーカーを認識できませんでした。フラッシュ方式で再試行します")
+        self.seen_markers = {}
+        self.calib_step = CALIB_DARK
+        self.calib_start = now
+
     def _calibration_step(self, cam_gray, now):
+        if self.calib_step == CALIB_ARUCO:
+            self._aruco_step(cam_gray, now)
+            return
         # 暗フレームは投影を真っ黒にして DARK_WAIT_SEC 待ってから撮る (演出の色が差分を潰さないように)
         if self.calib_step == CALIB_DARK and now - self.calib_start >= config.DARK_WAIT_SEC:
             self.dark_gray = cam_gray.copy()
             self.calib_step = CALIB_FLASH
             self.calib_start = now
         elif self.calib_step == CALIB_FLASH and now - self.calib_start > config.FLASH_WAIT_SEC:
-            found = detect_projection_corners(self.dark_gray, cam_gray)
-            if found is not None:
-                self.corners = found
-                self.save()
-                sound.play("calib_ok")
-                print(f"★ 成功: プロジェクターの四つ角を認識しました {self.corners}")
-            else:
-                print("★ 四隅を認識できませんでした (設定は変えていません)")
-            self.calib_step = CALIB_IDLE
-            self.reset_game(quiet=True)
+            self._finish_calibration(detect_projection_corners(self.dark_gray, cam_gray), "FLASH", now)
 
     def step(self, cam_frame, now):
         """カメラ1フレームを処理して (投影画面, 監視画面) を返す。"""
@@ -284,7 +323,7 @@ class App:
         if len(self.corners) == 4:
             try:
                 warped_bgr, warped_gray = warp_to_projector(cam_frame, self.corners)
-                if self.bg_gray is None:
+                if self.bg_gray is None or now < self.bg_settle_until:
                     self.bg_gray = warped_gray.copy()
                     self.tracker.reset()
             except Exception:
@@ -296,7 +335,7 @@ class App:
             print("★ ボーナスタイム終了")
 
         dart_mask = None
-        if self.calib_step == CALIB_IDLE:
+        if self.calib_step == CALIB_IDLE and now >= self.bg_settle_until:
             if self.game.phase == COOLDOWN:
                 if self.game.update(now) and warped_gray is not None:
                     self.bg_gray = warped_gray.copy()
@@ -311,7 +350,10 @@ class App:
                 except Exception as e:
                     print("Hit error:", e)
 
-        if self.calib_step == CALIB_DARK:
+        # キャリブ用の画面は render_projector を通さない
+        if self.calib_step == CALIB_ARUCO:
+            proj = calib_screen(config.PROJ_W, config.PROJ_H)
+        elif self.calib_step == CALIB_DARK:
             proj = np.zeros((config.PROJ_H, config.PROJ_W, 3), np.uint8)
         else:
             proj = self._render_projector(now)
@@ -320,8 +362,20 @@ class App:
                                  settled=self.last_settled,
                                  tracking_frames=self.tracker.seen,
                                  offset=self.hit_offset, offset_step=self.offset_step,
-                                 mode=self.mode, bonus_left=self.game.bonus_left(now))
+                                 mode=self.mode, bonus_left=self.game.bonus_left(now),
+                                 calib_status=self._calib_status(now),
+                                 calib_markers=self.seen_markers)
         return proj, monitor
+
+    def _calib_status(self, now):
+        """監視画面のガイド帯に出すキャリブ状況。無ければ None。"""
+        if self.calib_step == CALIB_ARUCO:
+            return f"AUTO ALIGN: MARKERS {len(self.seen_markers)}/4"
+        if self.calib_step in (CALIB_DARK, CALIB_FLASH):
+            return "AUTO ALIGN: FLASH (fallback)"
+        if self.calib_note and now < self.calib_note[1]:
+            return self.calib_note[0]
+        return None
 
 
 def _call_projector(args, **kw):
@@ -375,7 +429,7 @@ def print_help(demo):
     print("=========================================================")
     print(" ナーフ射的ゲーム" + (" [DEMO: 投影画面クリックで着弾]" if demo else ""))
     print("=========================================================")
-    print(" [C] / AUTO ALIGN : プロジェクターを光らせて四隅を自動認識")
+    print(" [C] / AUTO ALIGN : マーカーを投影して四隅を自動認識 (だめならフラッシュ方式)")
     print(" [M] / CLICK 4-PT : カメラ画面で4点クリックして手動設定")
     print(" クリック/ドラッグ: 一番近い角を動かす")
     print(" [TAB]            : 微調整する角を切替")
