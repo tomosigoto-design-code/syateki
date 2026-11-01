@@ -1513,12 +1513,129 @@ def _draw_peka(frame, w, h, age, end, fever, bg=True):
     _draw_lamp_body(frame, w, h, glass, (60, 10, 150), (210, 210, 220))
 
 
+# ---------------------------------------------------------------- round (無人運用のラウンド表示)
+# round_info: {"state": "attract"|"playing"|"result", "shots", "max_shots", "time_left", "prize_label",
+#              "prize_kind": "big"|"normal"|None, "result_started", 任意で "hint", "time_limit", "next_in"}
+# 表示はすべて半径300の外(右側の帯とスコアバー)。描いた後に円内を静的画像へ戻す。
+ROUND_RESULT_SECS = 10.0      # next_in が無いときの「次の人どうぞ」までの秒数
+ROUND_TIME_LIMIT = 60.0       # time_limit が無いときのゲージの満タン値
+
+
+def _jp_mask(text, px, fallback):
+    """日本語の字形マスク(縁取り付き, キャッシュ)。FontFace で描けなければ fallback(英字)。"""
+    key = ("jp", text, px)
+    if key not in _glyph_cache:
+        m = _ff_mask(text, px)
+        if m is None:
+            m = _hershey_mask(fallback, px / 34, max(1, px // 16))
+        m = np.pad(m, 6)
+        _glyph_cache[key] = (m, cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))))
+    return _glyph_cache[key]
+
+
+def _jp_text(frame, text, cx, cy, px, col, fallback, maxw=280, scale=1.0):
+    m, e = _jp_mask(text, px, fallback)
+    sc = min(scale, maxw / m.shape[1])
+    _paste_mask(frame, m, e, cx, cy, sc, col, (12, 12, 14))
+
+
+def _round_cx(w, center):
+    return (center[0] + QUIET_R + 10 + w - 30) / 2
+
+
+def _draw_round_attract(frame, w, h, center, info, now):
+    """呼び込み(右側の帯、ゆっくり脈打つ)。"""
+    cx = _round_cx(w, center)
+    k = 0.9 + 0.1 * math.sin(now * 2.4)
+    _jp_text(frame, "ダーツを撃って", cx, h * 0.24, 40, _scale(WHITE, k), "SHOOT A DART")
+    _jp_text(frame, "スタート!", cx, h * 0.24 + 58, 54, _scale(GOLD, k), "TO START!")
+    hint = info.get("hint") or "5発で高得点を狙え"
+    lines = [s.strip() for s in hint.split("→")] if "→" in hint else [hint]
+    if len(lines) == 2:
+        lines[1] = "→ " + lines[1]
+    y = h * 0.24 + 128
+    for ln in lines:
+        _jp_text(frame, ln, cx, y, 24, (230, 230, 230), "AIM FOR A HIGH SCORE")
+        y += 38
+    # 弾のアイコンで「5発」を見せる
+    n = int(info.get("max_shots") or 5)
+    for i in range(n):
+        x = int(cx - (n - 1) * 11 + i * 22)
+        cv2.circle(frame, (x, int(y + 10)), 7, _scale(GOLD, k), -1, AA)
+
+
+def _draw_round_bar(frame, w, h, center, radii, info, now):
+    """playing: スコアバーに残り発数(●●●○○)と残り時間。"""
+    bx0, by0, bx1, by1 = _bar_rect(w, h, center, radii)
+    mid = (bx0 + bx1) // 2
+    n = int(info.get("max_shots") or 5)
+    left = max(0, n - int(info.get("shots") or 0))
+    cv2.rectangle(frame, (bx0 + 4, by0 + 102), (mid - 3, by0 + 124), BAR_MID, -1)     # 発数の数字を隠す
+    step = min(17, (mid - bx0 - 26) // max(1, n - 1)) if n > 1 else 0
+    for i in range(n):
+        c = (bx0 + 22 + i * step, by0 + 113)
+        if i < left:
+            cv2.circle(frame, c, 6, GOLD, -1, AA)
+        else:
+            cv2.circle(frame, c, 6, (110, 110, 115), 1, AA)
+    tl = info.get("time_left")
+    if tl is not None:
+        tl = max(0.0, float(tl))
+        lim = float(info.get("time_limit") or ROUND_TIME_LIMIT)
+        hurry = tl < 10
+        col = (60, 70, 230) if hurry else (215, 215, 215)
+        txt = f"TIME {int(math.ceil(tl))}"
+        (tw, _), _ = cv2.getTextSize(txt, SIMPLEX, 0.42, 1)
+        cv2.putText(frame, txt, (bx1 - 16 - tw, by0 + 22), SIMPLEX, 0.42, col, 1, AA)
+        gy = by1 + 5
+        cv2.line(frame, (bx0, gy), (bx1, gy), (55, 55, 58), 3)
+        cv2.line(frame, (bx0, gy), (bx0 + int((bx1 - bx0) * min(1.0, tl / lim)), gy), col, 3)
+
+
+def _draw_round_result(frame, w, h, center, radii, info, total_score, now):
+    """result: 右側に大きく SCORE と景品。big は金色 + 紙吹雪・光の筋(ブル演出の流用)。"""
+    t0 = info.get("result_started")
+    age = now - t0 if t0 is not None else 10.0
+    big = info.get("prize_kind") == "big"
+    cx = _round_cx(w, center)
+    if big and 0 <= age < BULL_END:
+        fake = Hit(center[0], center[1], 100, t0)
+        _draw_rays(frame, center, age)
+        _draw_confetti(frame, center, radii, fake, age)
+    pop = 1 + 0.5 * math.exp(-max(0.0, age) * 9) * abs(math.cos(age * 14)) if big else 1.0
+    _text_center(frame, "SCORE", cx, h * 0.16, DUPLEX, 0.8, (200, 200, 200), 1)
+    txt = str(int(total_score))
+    sc = 2.6 * pop if big else 2.2
+    _text_center(frame, txt, cx, h * 0.29, DUPLEX, sc, INK, 10)
+    _text_center(frame, txt, cx, h * 0.29, DUPLEX, sc, GOLD if big else WHITE, 4)
+    label = info.get("prize_label")
+    if big:
+        k = 0.85 + 0.15 * math.sin(now * 5)
+        _jp_text(frame, label or "大きいお菓子", cx, h * 0.45, 40, _scale(GOLD, k), "BIG PRIZE")
+        _jp_text(frame, "GET!", cx, h * 0.45 + 52, 46, _scale(GOLD, k), "GET!")
+    else:
+        _jp_text(frame, "お菓子をどうぞ", cx, h * 0.47, 32, WHITE, "ENJOY A SNACK")
+    _jp_text(frame, "受付でお菓子を受け取ってね", cx, h * 0.62, 20, (225, 225, 225), "GET IT AT THE DESK")
+    nxt = info.get("next_in")
+    if nxt is None:
+        nxt = ROUND_RESULT_SECS - max(0.0, age)
+    nxt = max(0, int(math.ceil(nxt)))
+    m, _ = _jp_mask("次の人どうぞ", 22, "NEXT PLAYER")
+    num = f"({nxt})"
+    (nw, _), _ = cv2.getTextSize(num, DUPLEX, 0.7, 2)
+    gap = 8
+    x0 = cx - (m.shape[1] + gap + nw) / 2                 # 文字と秒数をまとめて中央寄せ
+    _jp_text(frame, "次の人どうぞ", x0 + m.shape[1] / 2, h * 0.70, 22, (230, 230, 230), "NEXT PLAYER")
+    _text_center(frame, num, x0 + m.shape[1] + gap + nw / 2, h * 0.70, DUPLEX, 0.7, GOLD, 2)
+
+
 # ---------------------------------------------------------------- main
 def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, int, int],
                      total_score: int, hits: list[Hit],
                      cooldown_progress: float | None,
                      calibrating: bool, now: float, mode: str = "normal",
-                     bonus_start: float | None = None, bonus_until: float | None = None) -> np.ndarray:
+                     bonus_start: float | None = None, bonus_until: float | None = None,
+                     round_info: dict | None = None) -> np.ndarray:
     """投影画面を1フレーム描いて BGR uint8 (h, w, 3) を返す。
 
     radii は (r100, r50, r10)。hits は古い順の全履歴。
@@ -1526,6 +1643,8 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
     calibrating=True のときは真っ白(カメラの投影範囲検出用)。
     mode は "normal" か "fever"。fever はブルの演出だけ派手になり、隅に FEVER MODE を出す。
     bonus_start <= now < bonus_until の間は2倍タイム(fever のみ): 発動時に龍、期間中は炎のリング。
+    round_info は無人運用のラウンド表示(None なら出さない)。state が attract / playing / result で、
+    呼び込み・残り発数と残り時間・結果と景品を、すべて判定円の外に出す(キーは _draw_round_* を参照)。
     """
     if calibrating:
         img = np.full((h, w, 3), 255, np.uint8)
@@ -1545,7 +1664,8 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
     intro = bonus and now - bonus_start < DRAGON_T + 0.4
     bull = _last_bull(hits, now, FEVER_END if fever else BULL_END)
     box = _bar_rect(w, h, center, radii)
-    outer = bool(bull) or bonus
+    rstate = round_info.get("state") if round_info else None
+    outer = bool(bull) or bonus or rstate in ("attract", "result")
     if bull:
         hit, age, streak = bull
         if fever:
@@ -1570,12 +1690,18 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
             _draw_bonus_telop(frame, w, h, center, tb, shake)
             _draw_seal(frame, tb, shake)
         _draw_dragons(frame, center, tb, total, intro, int(bonus_start * 10) & 0xFFFF, glow)
+    if rstate == "attract" and not bull:
+        _draw_round_attract(frame, w, h, center, round_info, now)
+    elif rstate == "result":
+        _draw_round_result(frame, w, h, center, radii, round_info, total_score, now)
     if outer:
         frame[box[1]:box[3] + 1, box[0]:box[2] + 1] = base[box[1]:box[3] + 1, box[0]:box[2] + 1]
     reel = bull[1] if (fever and bull and bull[0] is hits[-1]) else None
     _draw_bar(frame, w, h, center, radii, total_score, hits, cooldown_progress, now, fever=reel)
     if bonus:
         _draw_bonus_bar(frame, w, h, center, radii, now, bonus_start, bonus_until)
+    if rstate == "playing":
+        _draw_round_bar(frame, w, h, center, radii, round_info, now)
     if fever:
         _draw_fever_badge(frame, w, h, center, radii)
     if outer:      # 演出の下に隠れないよう、四隅マーカーは最後に描き直す
