@@ -1518,7 +1518,7 @@ def _draw_peka(frame, w, h, age, end, fever, bg=True):
 #              "prize_kind": "big"|"normal"|None, "result_started", 任意で "hint", "time_limit", "next_in"}
 # 表示はすべて半径300の外(右側の帯とスコアバー)。描いた後に円内を静的画像へ戻す。
 ROUND_RESULT_SECS = 10.0      # next_in が無いときの「次の人どうぞ」までの秒数
-ROUND_TIME_LIMIT = 60.0       # time_limit が無いときのゲージの満タン値
+ROUND_TIME_LIMIT = 40.0       # time_limit が無いときのゲージの満タン値(config.ROUND_TIMEOUT と同じ)
 
 
 def _jp_mask(text, px, fallback):
@@ -1617,6 +1617,8 @@ def _draw_round_result(frame, w, h, center, radii, info, total_score, now):
         _jp_text(frame, "お菓子をどうぞ", cx, h * 0.47, 32, WHITE, "ENJOY A SNACK")
     _jp_text(frame, "受付でお菓子を受け取ってね", cx, h * 0.62, 20, (225, 225, 225), "GET IT AT THE DESK")
     nxt = info.get("next_in")
+    if nxt is None:
+        nxt = info.get("time_left")      # app は RESULT 中、次のラウンドまでの残り秒を time_left で渡す
     if nxt is None:
         nxt = ROUND_RESULT_SECS - max(0.0, age)
     nxt = max(0, int(math.ceil(nxt)))
