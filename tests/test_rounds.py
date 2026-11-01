@@ -15,6 +15,12 @@ FULL = [[0, 0], [W, 0], [W, H], [0, H]]
 POS = {100: (CX, CY), 50: (CX + 100, CY), 10: (CX + 200, CY)}  # 点数ごとの着弾位置
 
 
+@pytest.fixture(autouse=True)
+def auto_round(monkeypatch):
+    """ラウンド制は既定で無効なので、このファイルでは有効にして試す。"""
+    monkeypatch.setattr(config, "AUTO_ROUND", True)
+
+
 @pytest.fixture
 def played(monkeypatch):
     from syateki import sound
@@ -42,7 +48,6 @@ def shoot(app, score, now):
 
 
 def test_defaults():
-    assert config.AUTO_ROUND is True
     assert (config.SHOTS_PER_ROUND, config.ROUND_TIMEOUT, config.IDLE_TIMEOUT, config.RESULT_SEC) == \
         (5, 40.0, 15.0, 10.0)
 
