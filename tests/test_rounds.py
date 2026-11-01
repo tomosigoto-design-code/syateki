@@ -19,6 +19,8 @@ POS = {100: (CX, CY), 50: (CX + 100, CY), 10: (CX + 200, CY)}  # 点数ごとの
 def auto_round(monkeypatch):
     """ラウンド制は既定で無効なので、このファイルでは有効にして試す。"""
     monkeypatch.setattr(config, "AUTO_ROUND", True)
+    # 景品の点数は会場で変わるので、テストは 300 点で固定して試す
+    monkeypatch.setattr(config, "PRIZE_TIERS", [(300, "大きいお菓子", "big"), (0, "お菓子", "normal")])
 
 
 @pytest.fixture
