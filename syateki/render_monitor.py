@@ -196,7 +196,8 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
                    settled=None, tracking_frames: int = 0,
                    offset: tuple[int, int] = (0, 0), offset_step: int = 0,
                    mode: str = "normal", bonus_left: float = 0.0,
-                   calib_status: str | None = None, calib_markers=None) -> np.ndarray:
+                   calib_status: str | None = None, calib_markers=None,
+                   round_status: str | None = None) -> np.ndarray:
     """カメラ監視画面を描画した BGR 画像を返す（入力は書き換えない）
 
     click_step: -1 なら通常表示。0〜3 なら「次に [n] をクリック」ガイドを表示
@@ -208,6 +209,7 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
     bonus_left: ボーナスタイム (スコア2倍) の残り秒。0 より大きければガイド帯に出す
     calib_status: 自動キャリブの状況 (例 "AUTO ALIGN: MARKERS 3/4")。ガイド帯に強調して出す
     calib_markers: 見えている ArUco マーカー {id: (4, 2) カメラ座標}。枠と id を描く
+    round_status: ラウンド制の状況 (例 "ROUND: 2/5 shots  31s")。ガイド帯の先頭に出す
     """
     img = cv2.cvtColor(cam_frame, cv2.COLOR_GRAY2BGR) if cam_frame.ndim == 2 else cam_frame.copy()
     h, w = img.shape[:2]
@@ -276,6 +278,9 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
         line1 = f"C: AUTO ALIGN / M: CLICK 4 / R: RESET / F: FULLSCREEN / P: {mode.upper()}"
         if bonus_left > 0:
             line1 = f"BONUS x2 {bonus_left:.1f}s / " + line1
+        if round_status:  # 無人運用中はキー一覧よりラウンド状況を優先
+            line1 = " / ".join([round_status] + ([f"BONUS x2 {bonus_left:.1f}s"] if bonus_left > 0 else [])
+                               + [mode.upper()])
         line2 = f"Drag corner / Arrows,WASD: fine-tune {lab} / {ofs} (IJKL, O: auto)"
         c1, c2 = (230, 255, 60), (210, 210, 210)
     max_w = w - 2 * m

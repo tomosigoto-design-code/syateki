@@ -13,10 +13,14 @@ W, H = config.PROJ_W, config.PROJ_H
 FULL = [[0, 0], [W, 0], [W, H], [0, H]]  # 恒等変換になる四隅
 
 
-def make_app(tmp_path, demo=False):
+def make_app(tmp_path, demo=False, auto_round=False):
+    """auto_round=False (既定) はラウンド制なしの従来動作。ラウンド制は test_rounds.py で見る。"""
     p = tmp_path / "corners.json"
     p.write_text(json.dumps(FULL))
-    return App(demo=demo, corners_path=str(p), settings_path=str(tmp_path / "settings.json")), p
+    app = App(demo=demo, corners_path=str(p), settings_path=str(tmp_path / "settings.json"))
+    if not auto_round:
+        app.round = None
+    return app, p
 
 
 def bg_frame():
@@ -464,7 +468,8 @@ def test_projector_receives_bonus(tmp_path, monkeypatch):
     cx, cy = config.TARGET_CENTER
     _shoot(app, cx, cy, 1.0), _shoot(app, cx, cy, 3.0)
     app.step(bg_frame(), 4.0)
-    assert calls[-1] == {"mode": "fever", "bonus_start": 3.0, "bonus_until": 3.0 + config.BONUS_SEC}
+    assert calls[-1] == {"mode": "fever", "bonus_start": 3.0, "bonus_until": 3.0 + config.BONUS_SEC,
+                         "round_info": None}
 
 
 def test_projector_with_mode_only_falls_back(tmp_path, monkeypatch):

@@ -36,6 +36,10 @@ fever ではブルを2連続で当てると5秒間スコア2倍のボーナス�
 ボーナス中の BGM は `bgm/` に mp3/wav を置くと流れる (なければ内蔵のループ)。
 | `ESC` / `Q` | 終了 |
 
+無人運用 (`config.AUTO_ROUND = True`、既定): 最初の着弾でラウンド開始、5発・開始40秒・最後の着弾から15秒のどれかで終了。
+結果を10秒表示 (この間の着弾は無視、弾の回収時間) した後、自動でリセットして次の人を待つ。スタッフの `R` は不要 (押せば即待機へ)。
+景品の点数 (既定 300点以上で大きいお菓子) は `syateki/config.py` 先頭の `PRIZE_TIERS` で変える。点数は fever の2倍込み。
+
 四隅の設定は `corners.json`、着弾補正と演出モードは `settings.json` に保存され、次回起動時に読み込まれる。
 
 着弾補正 (判定が実際の着弾とずれるとき):
@@ -55,6 +59,7 @@ syateki/
   detector.py           着弾検出・止まるまでの追跡・スコア判定
   settings.py           settings.json (着弾補正・演出モード) の読み書き
   game.py               スコア・履歴・READY/COOLDOWN
+  rounds.py             無人運用のラウンド制・景品判定
   render_projector.py   投影画面の描画
   render_monitor.py     監視画面の描画
   sound.py              効果音

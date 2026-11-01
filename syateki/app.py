@@ -14,6 +14,7 @@ from .game import COOLDOWN, GameState
 from .keys import decode_key
 from .render_monitor import BUTTONS, render_monitor
 from .render_projector import render_projector
+from .rounds import RESULT, RoundState
 from .settings import MODES, load_mode, load_offset, save_mode, save_offset
 from . import sound
 
@@ -73,6 +74,7 @@ class App:
         self.bg_settle_until = 0.0  # この時刻までは背景を撮り続け、検出しない (キャリブ画面の残像対策)
         self.bg_gray = None
         self.game = GameState()
+        self.round = RoundState() if config.AUTO_ROUND else None  # 無人運用のラウンド制
         self.fullscreen = False
         self.running = True
 
@@ -81,6 +83,8 @@ class App:
         """スコアと背景をリセット。quiet=True は角の設定変更に伴うリセット (音なし)。"""
         had_bonus = self.game.bonus_until is not None
         self.game.reset()
+        if self.round is not None:
+            self.round.reset()
         if had_bonus:
             _bgm("bgm_stop")
         self.bg_gray = None
@@ -234,9 +238,12 @@ class App:
             pass
 
     # ------------------------------------------------------------ 1フレーム
+    def _accepts_hits(self):
+        return self.round is None or self.round.accepts_hits()
+
     def _register(self, x, y, now):
         score = score_for_point(x, y)
-        if score <= 0:
+        if score <= 0 or not self._accepts_hits():  # RESULT 中の着弾は無視
             return 0
         mult, event = self.game.register_hit(x, y, score, now, fever=self.mode == "fever")
         bonus = f" x{mult} (ボーナス残り {self.game.bonus_left(now):.1f}秒)" if mult > 1 else ""
@@ -248,7 +255,30 @@ class App:
             print(f"★ ボーナスタイム開始! {config.BONUS_SEC:.0f}秒間スコア2倍")
         elif event == "extend":  # BGM は止めずに流し続ける
             print(f"★ ボーナスタイム延長! 残り {self.game.bonus_left(now):.1f}秒")
+        if self.round is not None:
+            r = self.round
+            if r.shots == 0:
+                print("★ ラウンド開始!")
+            if r.on_hit(now, self.game.total_score) == "result":
+                self._on_round_result()
+            else:
+                print(f"★ ラウンド {r.shots}/{config.SHOTS_PER_ROUND}発 (残り {r.time_left(now):.0f}秒)")
         return score
+
+    def _on_round_result(self):
+        r = self.round
+        label, kind = r.prize
+        why = {"shots": f"{config.SHOTS_PER_ROUND}発", "round_timeout": "制限時間",
+               "idle_timeout": "着弾なし"}[r.end_reason]
+        print(f"★ ラウンド終了 ({why}): {r.score}点 → 景品: {label or 'なし'}"
+              f" ({config.RESULT_SEC:.0f}秒後に自動リセット)")
+        if self.game.end_bonus():  # ラウンドが終わったらボーナスも終わり
+            _bgm("bgm_stop")
+        names = getattr(sound, "NAMES", ())
+        if kind == "big":
+            sound.play("prize_big" if "prize_big" in names else "hit100_fever")
+        elif kind is not None:
+            sound.play("prize" if "prize" in names else "calib_ok")
 
     def _on_settled(self, settled, now):
         self.last_settled = settled
@@ -266,7 +296,8 @@ class App:
                 self.game.total_score, self.game.hits, self.game.cooldown_progress(now),
                 self.calib_step == CALIB_FLASH, now)
         return _call_projector(args, mode=self.mode, bonus_start=self.game.bonus_start,
-                               bonus_until=self.game.bonus_until)
+                               bonus_until=self.game.bonus_until,
+                               round_info=None if self.round is None else self.round.info(now))
 
     def _finish_calibration(self, found, how, now):
         if found is not None:
@@ -333,9 +364,16 @@ class App:
             _bgm("bgm_stop")
             sound.play("bonus_end")
             print("★ ボーナスタイム終了")
+        if self.round is not None:
+            ev = self.round.update(now, self.game.total_score)
+            if ev == "result":
+                self._on_round_result()
+            elif ev == "reset":
+                self.reset_game(quiet=True)
+                print("★ 結果表示おわり → 次の人を待機中")
 
         dart_mask = None
-        if self.calib_step == CALIB_IDLE and now >= self.bg_settle_until:
+        if self.calib_step == CALIB_IDLE and now >= self.bg_settle_until and self._accepts_hits():
             if self.game.phase == COOLDOWN:
                 if self.game.update(now) and warped_gray is not None:
                     self.bg_gray = warped_gray.copy()
@@ -364,7 +402,8 @@ class App:
                                  offset=self.hit_offset, offset_step=self.offset_step,
                                  mode=self.mode, bonus_left=self.game.bonus_left(now),
                                  calib_status=self._calib_status(now),
-                                 calib_markers=self.seen_markers)
+                                 calib_markers=self.seen_markers,
+                                 round_status=None if self.round is None else self.round.status(now))
         return proj, monitor
 
     def _calib_status(self, now):
