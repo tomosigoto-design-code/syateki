@@ -64,7 +64,7 @@ def test_defaults():
     d = DEFAULTS
     assert d["AUTO_ROUND"] is False
     assert (d["SHOTS_PER_ROUND"], d["ROUND_TIMEOUT"], d["IDLE_TIMEOUT"], d["RESULT_SEC"]) == \
-        (6, 60.0, None, 15.0)
+        (6, None, None, 15.0)
     assert d["PRIZE_TIERS"][0][:2] == (350, "大きいお菓子")
     assert prize_hint(d["PRIZE_TIERS"], d["SHOTS_PER_ROUND"]) == "6発で350点以上 → 大きいお菓子"
 
@@ -79,6 +79,17 @@ def test_no_idle_timeout_when_none(tmp_path, monkeypatch):
     assert app.round.state == PLAYING
     app.step(bg(), 1.0 + config.ROUND_TIMEOUT)
     assert app.round.state == RESULT and app.round.end_reason == "round_timeout"
+
+
+def test_no_time_limit_when_none(tmp_path, monkeypatch):
+    """ROUND_TIMEOUT も IDLE_TIMEOUT も None なら、時間では終わらない (発数だけ)。"""
+    monkeypatch.setattr(config, "ROUND_TIMEOUT", None)
+    monkeypatch.setattr(config, "IDLE_TIMEOUT", None)
+    app = make(tmp_path)
+    shoot(app, 50, 1.0)
+    assert app.round.time_left(2.0) is None
+    app.step(bg(), 10_000.0)
+    assert app.round.state == PLAYING
 
 
 @pytest.mark.parametrize("score,kind", [(0, "normal"), (299, "normal"), (300, "big"), (999, "big")])

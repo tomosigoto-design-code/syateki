@@ -7,7 +7,7 @@ import numpy as np
 # 会場では U キーで切り替える (settings.json に保存され、そちらが優先)。ここは初期値。
 AUTO_ROUND = False
 SHOTS_PER_ROUND = 6   # 1人が撃てる弾の数 (刺さった弾だけ数える)
-ROUND_TIMEOUT = 60.0  # ラウンド開始からこの秒数で終了
+ROUND_TIMEOUT = None  # ラウンド開始からこの秒数で終了。None なら時間制限なし (6発で終了)
 IDLE_TIMEOUT = None   # 最後の着弾からこの秒数で終了。None なら使わない (時間で勝手に終わらせない)
 RESULT_SEC = 15.0     # 結果を表示する秒数 (この間の着弾は無視。弾を回収する時間)
 # 景品: (この点数以上, 表示名, 種類 "big"/"normal")。上から順に見て、最初に届いたもの。

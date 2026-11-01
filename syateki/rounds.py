@@ -1,7 +1,7 @@
 """無人運用のラウンド制 (config.AUTO_ROUND)。ATTRACT → PLAYING → RESULT → ATTRACT。
 
 ATTRACT: 待機。最初の着弾で PLAYING (その1発目から数える)。
-PLAYING: SHOTS_PER_ROUND 発、ROUND_TIMEOUT 秒、最後の着弾から IDLE_TIMEOUT 秒 (None なら無し) のどれかで終了。
+PLAYING: SHOTS_PER_ROUND 発、ROUND_TIMEOUT 秒、最後の着弾から IDLE_TIMEOUT 秒 (秒数は None なら無し) のどれかで終了。
 RESULT : RESULT_SEC 秒結果を出す (着弾は無視、弾の回収時間)。その後 app が全部リセット。
 """
 from . import config
@@ -68,16 +68,18 @@ class RoundState:
         return None
 
     def deadline(self):
-        """PLAYING の終了予定時刻 (早い方)。"""
-        end = self.started + config.ROUND_TIMEOUT
+        """PLAYING の終了予定時刻 (早い方)。時間制限が無ければ None。"""
+        ends = []
+        if config.ROUND_TIMEOUT is not None:
+            ends.append(self.started + config.ROUND_TIMEOUT)
         if config.IDLE_TIMEOUT is not None:
-            end = min(end, self.last_hit + config.IDLE_TIMEOUT)
-        return end
+            ends.append(self.last_hit + config.IDLE_TIMEOUT)
+        return min(ends) if ends else None
 
     def update(self, now, score):
         """毎フレーム呼ぶ。"result" (タイムアウトで終了) / "reset" (結果表示が終わった) / None"""
         if self.state == PLAYING:
-            if now - self.started >= config.ROUND_TIMEOUT:
+            if config.ROUND_TIMEOUT is not None and now - self.started >= config.ROUND_TIMEOUT:
                 return self._finish(now, score, "round_timeout")
             if config.IDLE_TIMEOUT is not None and now - self.last_hit >= config.IDLE_TIMEOUT:
                 return self._finish(now, score, "idle_timeout")
@@ -87,7 +89,8 @@ class RoundState:
 
     def time_left(self, now):
         if self.state == PLAYING:
-            return max(0.0, self.deadline() - now)
+            end = self.deadline()
+            return None if end is None else max(0.0, end - now)
         if self.state == RESULT:
             return max(0.0, self.result_started + config.RESULT_SEC - now)
         return None
@@ -104,6 +107,8 @@ class RoundState:
         if self.state == ATTRACT:
             return "ROUND: WAITING (first hit starts)"
         if self.state == PLAYING:
-            return f"ROUND: {self.shots}/{config.SHOTS_PER_ROUND} shots  {self.time_left(now):.0f}s"
+            tl = self.time_left(now)
+            left = "" if tl is None else f"  {tl:.0f}s"
+            return f"ROUND: {self.shots}/{config.SHOTS_PER_ROUND} shots{left}"
         kind = (self.prize[1] or "none").upper()
         return f"RESULT {self.score}pt -> {kind} PRIZE  (next {self.time_left(now):.0f}s)"

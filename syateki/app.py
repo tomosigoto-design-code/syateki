@@ -278,7 +278,9 @@ class App:
             if r.on_hit(now, self.game.total_score) == "result":
                 self._on_round_result()
             else:
-                print(f"★ ラウンド {r.shots}/{config.SHOTS_PER_ROUND}発 (残り {r.time_left(now):.0f}秒)")
+                tl = r.time_left(now)
+                left = "" if tl is None else f" (残り {tl:.0f}秒)"
+                print(f"★ ラウンド {r.shots}/{config.SHOTS_PER_ROUND}発{left}")
         return score
 
     def _on_round_result(self):
