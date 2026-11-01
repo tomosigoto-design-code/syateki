@@ -27,6 +27,23 @@ def bg_frame():
     return np.full((H, W, 3), 120, np.uint8)
 
 
+DT = 0.03  # 1フレームの間隔 (約33fps)
+
+
+def hold(app, frame, t, dur):
+    """frame を dur 秒間 (DT 刻み) 見せ続ける。最後の時刻を返す。"""
+    end = t + dur
+    while t < end - 1e-9:
+        t += DT
+        app.step(frame, t)
+    return t
+
+
+def stick(app, frame, t):
+    """弾が止まって刺さったと判定されるまで見せる (STICK_SEC + 止まり判定 + 余裕)。"""
+    return hold(app, frame, t, config.STICK_SEC + DT * (config.SETTLE_FRAMES + 1))
+
+
 def dart_frame(x, y):
     f = bg_frame()
     cv2.ellipse(f, (x, y), (8, 25), 0, 0, 360, (200, 80, 20), -1)
@@ -54,20 +71,17 @@ def test_pipeline_detects_dart_and_cooldown(tmp_path):
     t = 1000.0
     app.step(bg, t)  # 背景を撮る
     dart = dart_frame(config.TARGET_CENTER[0], config.TARGET_CENTER[1] - 10)
-    for i in range(config.SETTLE_FRAMES - 1):  # 止まるまでは確定しない
-        app.step(dart, t + 0.03 * (i + 1))
-        assert app.game.total_score == 0 and app.game.ready and app.tracker.tracking
-    t += 0.03 * config.SETTLE_FRAMES
-    proj, mon = app.step(dart, t)
+    t = hold(app, dart, t, config.STICK_SEC * 0.8)  # 止まっても STICK_SEC 経つまでは確定しない
+    assert app.game.total_score == 0 and app.game.ready and app.tracker.tracking
+    assert app.tracker.stick_progress(t) is not None
+    t = hold(app, dart, t, config.STICK_SEC * 0.4)
     assert app.game.total_score == 100 and app.game.phase == COOLDOWN
-    assert app.last_settled.reason == "settled" and app.last_settled.frames == config.SETTLE_FRAMES
-    assert proj.shape == (H, W, 3) and mon.shape == (H, W, 3)
+    assert app.last_settled.reason == "stuck"
     app.step(dart, t + 0.5)  # COOLDOWN 中は検出しない
     assert app.game.total_score == 100
     app.step(dart, t + config.COOLDOWN_SEC)  # 終了: 今の映像を背景にする
     assert app.game.phase == READY
-    for i in range(5):  # 弾が刺さったままでも二重計上しない
-        app.step(dart, t + 2.0 + i * 0.03)
+    hold(app, dart, t + 2.0, 1.0)  # 弾が刺さったままでも二重計上しない
     assert app.game.total_score == 100 and len(app.game.hits) == 1
 
 
@@ -79,45 +93,86 @@ def test_pipeline_scores_where_dart_stops(tmp_path):
     t = 0.0
     app.step(bg_frame(), t)
     # 最初のフレームは 10点圏 (cy-230)、止まるのは 100点圏 (cy-20)
-    path = [cy - 230, cy - 170, cy - 110, cy - 50] + [cy - 20] * config.SETTLE_FRAMES
-    for y in path:
-        t += 0.03
+    for y in [cy - 230, cy - 170, cy - 110, cy - 50]:
+        t += DT
         app.step(dart_frame(cx, y), t)
+    stick(app, dart_frame(cx, cy - 20), t)
     assert len(app.game.hits) == 1 and app.game.hits[0].score == 100
     expect, _ = find_hit(blur_gray(bg_frame()), dart_frame(cx, cy - 20), offset=(0, 0))
     assert (app.game.hits[0].x, app.game.hits[0].y) == (expect.x, expect.y)
-    assert app.last_settled.reason == "settled" and app.last_settled.frames == len(path)
+    assert app.last_settled.reason == "stuck"
 
 
 def test_pipeline_flicker_then_stop(tmp_path):
-    """飛行中に1フレーム検出が欠けても、最初の位置で確定せず止まった位置で判定する。"""
+    """飛行中に1フレーム検出が欠けても、止まって刺さった位置で判定する。"""
     app, _ = make_app(tmp_path)
     cx, cy = config.TARGET_CENTER
-    frames = [dart_frame(cx, cy - 230), bg_frame(), dart_frame(cx, cy - 120)] + \
-        [dart_frame(cx, cy - 20)] * config.SETTLE_FRAMES
     app.step(bg_frame(), 0.0)
-    for i, f in enumerate(frames):
-        app.step(f, 0.03 * (i + 1))
-    assert app.last_settled.reason == "settled"
+    t = 0.0
+    for f in [dart_frame(cx, cy - 230), bg_frame(), dart_frame(cx, cy - 120)]:
+        t += DT
+        app.step(f, t)
+    stick(app, dart_frame(cx, cy - 20), t)
+    assert app.last_settled.reason == "stuck"
     assert len(app.game.hits) == 1 and app.game.hits[0].score == 100
 
 
-@pytest.mark.parametrize("mode,score", [("last", 10), ("drop", 0)])
-def test_pipeline_one_frame_blip(tmp_path, monkeypatch, mode, score):
-    """1フレームだけ出て消えた弾 (跳ね返り): last は最後の位置で確定、drop は無効。"""
-    monkeypatch.setattr(config, "SETTLE_LOST", mode)
+def _gone(app, t):
+    """候補が消えてから無効と判定されるまで (SETTLE_GRACE フレーム) 何も無い映像を見せる。"""
+    for _ in range(config.SETTLE_GRACE):
+        t += DT
+        app.step(bg_frame(), t)
+    return t
+
+
+def test_one_frame_blip_is_rejected(tmp_path):
+    """1フレームだけの誤検出は無効。背景はすぐ撮り直す。"""
+    assert config.SETTLE_LOST == "drop"
     app, _ = make_app(tmp_path)
     cx, cy = config.TARGET_CENTER
     app.step(bg_frame(), 0.0)
-    app.step(dart_frame(cx + 200, cy), 0.03)
-    assert app.game.total_score == 0
-    for i in range(config.SETTLE_GRACE - 1):  # 猶予中はまだ確定しない
-        app.step(bg_frame(), 0.06 + 0.03 * i)
-        assert app.game.total_score == 0 and app.tracker.tracking
-    app.step(bg_frame(), 0.06 + 0.03 * config.SETTLE_GRACE)
-    assert app.game.total_score == score and app.last_settled.reason == "lost"
-    assert (app.last_settled.hit is None) == (mode == "drop")
-    assert app.game.ready == (mode == "drop")
+    app.step(dart_frame(cx + 200, cy), DT)
+    _gone(app, DT)
+    assert app.game.total_score == 0 and app.game.ready
+    assert app.last_settled.reason == "bounced" and app.last_settled.hit is None
+    assert not app.tracker.tracking
+
+
+def test_stop_then_vanish_is_rejected(tmp_path):
+    """止まったがすぐ消えた (当たって跳ね返った) 弾は無効。"""
+    app, _ = make_app(tmp_path)
+    cx, cy = config.TARGET_CENTER
+    app.step(bg_frame(), 0.0)
+    t = hold(app, dart_frame(cx, cy), 0.0, DT * (config.SETTLE_FRAMES + 2))
+    assert app.tracker.stick_progress(t) is not None   # 止まった
+    _gone(app, t)
+    assert app.game.total_score == 0 and app.last_settled.reason == "bounced"
+
+
+def test_moving_object_is_rejected(tmp_path):
+    """動き続けるもの (人の手・揺れる物) は無効。"""
+    app, _ = make_app(tmp_path)
+    cx, cy = config.TARGET_CENTER
+    app.step(bg_frame(), 0.0)
+    t, y = 0.0, cy - 200
+    while app.tracker.tracking or t == 0.0:
+        t += DT
+        y += 15
+        app.step(dart_frame(cx, y), t)
+        assert t < 2.0
+    assert app.last_settled.reason == "moving" and app.game.total_score == 0
+    assert t == pytest.approx(config.SETTLE_TIMEOUT, abs=DT * 1.5)
+
+
+def test_last_mode_keeps_old_behavior(tmp_path, monkeypatch):
+    """SETTLE_LOST = "last" (旧動作) なら見失った候補も最後の位置で確定する。"""
+    monkeypatch.setattr(config, "SETTLE_LOST", "last")
+    app, _ = make_app(tmp_path)
+    cx, cy = config.TARGET_CENTER
+    app.step(bg_frame(), 0.0)
+    app.step(dart_frame(cx + 200, cy), DT)
+    _gone(app, DT)
+    assert app.game.total_score == 10 and app.last_settled.reason == "lost"
 
 
 def test_offset_keys_save_and_reload(tmp_path):
@@ -139,8 +194,7 @@ def test_offset_used_by_detection(tmp_path):
     app.set_offset(0, 30)
     cx, cy = config.TARGET_CENTER
     app.step(bg_frame(), 0.0)
-    for i in range(config.SETTLE_FRAMES):
-        app.step(dart_frame(cx, cy - 10), 0.03 * (i + 1))
+    stick(app, dart_frame(cx, cy - 10), 0.0)
     h = app.last_settled.hit
     assert (h.x, h.y) == (int(h.raw[0]), int(h.raw[1] + 30))
     assert app.game.hits[0].y == h.y
@@ -164,8 +218,7 @@ def test_one_click_offset_calibration(tmp_path):
     cx, cy = config.TARGET_CENTER
     assert app.handle_key(ord("o")) and app.offset_step == OFS_WAIT_SHOT
     app.step(bg_frame(), 0.0)
-    for i in range(config.SETTLE_FRAMES):
-        app.step(dart_frame(cx, cy - 10), 0.03 * (i + 1))
+    stick(app, dart_frame(cx, cy - 10), 0.0)
     assert app.offset_step == OFS_WAIT_CLICK
     rx, ry = app.offset_ref
     app.on_proj_mouse(cv2.EVENT_LBUTTONDOWN, int(rx) + 3, int(ry) - 8, 0)
@@ -196,8 +249,11 @@ def test_monitor_shows_tracking_and_offset(tmp_path):
     _, m1 = app.step(dart_frame(cx, cy), 0.03)   # 追跡中
     assert app.tracker.seen == 1
     app.handle_key(ord("o"))
-    _, m2 = app.step(dart_frame(cx, cy), 0.06)
-    _, m3 = app.step(dart_frame(cx, cy), 0.09)   # 確定
+    t = hold(app, dart_frame(cx, cy), 0.03, DT * 4)
+    _, m2 = app.step(dart_frame(cx, cy), t + DT)  # 刺さり確認中 (STUCK? 表示)
+    assert app.tracker.stick_progress(t + DT) is not None
+    stick(app, dart_frame(cx, cy), t + DT)        # 確定
+    _, m3 = app.step(dart_frame(cx, cy), 5.0)
     assert app.last_settled is not None
     assert not np.array_equal(m1, m3)
 
@@ -468,8 +524,7 @@ def test_projector_receives_bonus(tmp_path, monkeypatch):
     cx, cy = config.TARGET_CENTER
     _shoot(app, cx, cy, 1.0), _shoot(app, cx, cy, 3.0)
     app.step(bg_frame(), 4.0)
-    assert calls[-1] == {"mode": "fever", "bonus_start": 3.0, "bonus_until": 3.0 + config.BONUS_SEC,
-                         "round_info": None}
+    assert calls[-1] == {"mode": "fever", "bonus_start": 3.0, "bonus_until": 3.0 + config.BONUS_SEC}
 
 
 def test_projector_with_mode_only_falls_back(tmp_path, monkeypatch):

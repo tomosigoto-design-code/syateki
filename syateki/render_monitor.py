@@ -161,15 +161,17 @@ def _draw_preview(img, src, x, y, pw, ph, label, color, ui):
     cv2.putText(img, label, (x + 4, y + th + 3), FONT, s, (20, 20, 20), 1, AA)
 
 
-def _hit_status(settled, tracking_frames):
-    """DART SENSOR の下に出す1行。追跡中なら追跡フレーム数、確定後は方式と理由"""
+def _hit_status(settled, tracking_frames, stick_progress=None):
+    """DART SENSOR の下に出す1行。追跡中なら追跡フレーム数 (刺さり確認中は経過秒)、終わったら結末"""
     if tracking_frames > 0:
+        if stick_progress is not None:
+            return f"STUCK? {stick_progress:.1f}s ({tracking_frames}f)", GUIDE_HI
         return f"TRACKING {tracking_frames}f ...", GUIDE_HI
     if settled is None:
         return None, None
     h = settled.hit
     if h is None:
-        return f"DROPPED (lost {settled.frames}f)", (90, 90, 255)
+        return f"REJECTED: {settled.reason} ({settled.frames}f)", (90, 90, 255)
     how = f"ORANGE {h.orange_px}px" if h.method == "orange" else f"LOWEST (orange {h.orange_px}px)"
     return f"{how} / {settled.reason} {settled.frames}f / ({h.x},{h.y})", (255, 255, 255)
 
@@ -193,16 +195,17 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
                    warped_bgr: np.ndarray | None,
                    dart_mask: np.ndarray | None,
                    corner_labels: list[str], corner_colors: list[tuple],
-                   settled=None, tracking_frames: int = 0,
+                   settled=None, tracking_frames: int = 0, stick_progress: float | None = None,
                    offset: tuple[int, int] = (0, 0), offset_step: int = 0,
                    mode: str = "normal", bonus_left: float = 0.0,
                    calib_status: str | None = None, calib_markers=None,
-                   round_status: str | None = None) -> np.ndarray:
+                   round_status: str | None = None, auto_round: bool | None = None) -> np.ndarray:
     """カメラ監視画面を描画した BGR 画像を返す（入力は書き換えない）
 
     click_step: -1 なら通常表示。0〜3 なら「次に [n] をクリック」ガイドを表示
     settled: 直近の確定結果 (detector.Settled)。DART SENSOR に着弾点と方式を出す
     tracking_frames: 着弾候補を追跡中のフレーム数 (0 = 追跡していない)
+    stick_progress: 止まった候補が刺さっているかの確認の経過秒 (None = 確認中でない)
     offset: 現在の HIT_OFFSET。ガイド帯に出す
     offset_step: 1 = 補正モードで着弾待ち、2 = 投影画面のクリック待ち
     mode: 演出モード ("normal" / "fever")。ガイド帯に出す
@@ -210,6 +213,7 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
     calib_status: 自動キャリブの状況 (例 "AUTO ALIGN: MARKERS 3/4")。ガイド帯に強調して出す
     calib_markers: 見えている ArUco マーカー {id: (4, 2) カメラ座標}。枠と id を描く
     round_status: ラウンド制の状況 (例 "ROUND: 2/5 shots  31s")。ガイド帯の先頭に出す
+    auto_round: 自動 (ラウンド制) の ON/OFF。None でなければガイド帯に "AUTO: ON (U)" を出す
     """
     img = cv2.cvtColor(cam_frame, cv2.COLOR_GRAY2BGR) if cam_frame.ndim == 2 else cam_frame.copy()
     h, w = img.shape[:2]
@@ -234,7 +238,7 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
         sy0 = py + ph + m
         _draw_preview(img, dart_mask, px, sy0, pw, ph, "DART SENSOR", MASK_COLOR, ui)
         _draw_hit_on_sensor(img, settled, dart_mask.shape, px, sy0, pw, ph)
-        status, scol = _hit_status(settled, tracking_frames)
+        status, scol = _hit_status(settled, tracking_frames, stick_progress)
         if status:
             ss = _fit_scale(status, FONT_S, 0.4 * ui, 1, pw)
             (tw, tht), base = cv2.getTextSize(status, FONT_S, ss, 1)
@@ -275,12 +279,14 @@ def render_monitor(cam_frame: np.ndarray, corners: list[list[int]], selected_idx
         c1, c2 = GUIDE_HI, (255, 255, 255)
     else:
         lab = corner_labels[selected_idx % len(corner_labels)] if corner_labels else ""
-        line1 = f"C: AUTO ALIGN / M: CLICK 4 / R: RESET / F: FULLSCREEN / P: {mode.upper()}"
+        auto = [] if auto_round is None else [f"AUTO: {'ON' if auto_round else 'OFF'} (U)"]
+        line1 = " / ".join(["C: AUTO ALIGN / M: CLICK 4 / R: RESET / F: FULLSCREEN", f"P: {mode.upper()}"]
+                           + auto)
         if bonus_left > 0:
             line1 = f"BONUS x2 {bonus_left:.1f}s / " + line1
         if round_status:  # 無人運用中はキー一覧よりラウンド状況を優先
             line1 = " / ".join([round_status] + ([f"BONUS x2 {bonus_left:.1f}s"] if bonus_left > 0 else [])
-                               + [mode.upper()])
+                               + [mode.upper()] + auto)
         line2 = f"Drag corner / Arrows,WASD: fine-tune {lab} / {ofs} (IJKL, O: auto)"
         c1, c2 = (230, 255, 60), (210, 210, 210)
     max_w = w - 2 * m

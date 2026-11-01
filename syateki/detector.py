@@ -128,41 +128,56 @@ def detect_hit(bg_gray, frame_bgr, center=config.TARGET_CENTER, radius=config.R1
 
 
 class Settled(NamedTuple):
-    """確定した着弾。reason は "settled" / "lost" / "timeout"。hit は lost+drop なら None。"""
+    """追跡の結末。reason が "stuck" なら着弾 (hit あり)。
+
+    無効 (hit は None): "bounced" = 見えなくなった (跳ね返り・一瞬の誤検出)、
+    "moving" = 止まらないまま SETTLE_TIMEOUT 秒、"timeout" = 止まっても STICK_SEC 動かずに居続けなかった。
+    SETTLE_LOST = "last" のときだけ、見失った候補を最後の位置で確定する (reason "lost")。
+    """
     hit: "Hit | None"
     reason: str
     frames: int
 
+    @property
+    def valid(self):
+        return self.hit is not None
+
 
 class HitTracker:
-    """候補が止まるまで追跡し、止まった位置で着弾を確定する。
+    """壁に刺さった (くっついた) 弾だけを着弾にする。
 
-    最初の候補フレームは飛行中・跳ね返り中のことが多いので使わない。
-    連続 SETTLE_FRAMES フレームが SETTLE_PX 以内に収まったら最後の位置で確定。
-    SETTLE_GRACE フレーム続けて見えなければ見失ったとみなし、SETTLE_LOST
-    ("last": 最後に見えた位置 / "drop": 無効)。猶予中に再検出されたら追跡を続ける。
-    SETTLE_TIMEOUT 秒を超えたらその時点の位置で確定。
+    1) 候補が出たら追跡し、連続 SETTLE_FRAMES フレームが SETTLE_PX 以内に収まったら「止まった」。
+    2) そこからさらに STICK_SEC 秒、同じ位置 (SETTLE_PX 以内) に見え続けたら着弾 ("stuck")。
+    途中で SETTLE_GRACE フレーム続けて見えなければ無効 ("bounced")。止まった後に動いたら 1) に戻る。
+    止まらないまま SETTLE_TIMEOUT 秒 → "moving"、全体で SETTLE_TIMEOUT + STICK_SEC 秒 → "timeout"。
     """
 
-    def __init__(self, frames=None, px=None, timeout=None, lost=None, grace=None):
+    def __init__(self, frames=None, px=None, timeout=None, lost=None, grace=None, stick=None):
         self.frames = config.SETTLE_FRAMES if frames is None else frames
         self.px = config.SETTLE_PX if px is None else px
         self.timeout = config.SETTLE_TIMEOUT if timeout is None else timeout
         self.lost = config.SETTLE_LOST if lost is None else lost
         self.grace = config.SETTLE_GRACE if grace is None else grace
+        self.stick = config.STICK_SEC if stick is None else stick
         self.reset()
 
     def reset(self):
-        self.start = None   # 追跡開始時刻 (None = 追跡していない)
-        self.last = None    # 最後に見えた Hit
-        self.anchor = None  # 静止判定の基準点
-        self.run = 0        # anchor から SETTLE_PX 以内に収まった連続フレーム数
-        self.seen = 0       # 追跡開始からのフレーム数 (見えなかったフレームも数える)
-        self.misses = 0     # 連続で見えなかったフレーム数
+        self.start = None       # 追跡開始時刻 (None = 追跡していない)
+        self.last = None        # 最後に見えた Hit
+        self.anchor = None      # 静止判定の基準点
+        self.run = 0            # anchor から SETTLE_PX 以内に収まった連続フレーム数
+        self.seen = 0           # 追跡開始からのフレーム数 (見えなかったフレームも数える)
+        self.misses = 0         # 連続で見えなかったフレーム数
+        self.stopped_at = None  # 止まった時刻 (刺さり確認中)
+        self.ever_stopped = False
 
     @property
     def tracking(self):
         return self.start is not None
+
+    def stick_progress(self, now):
+        """刺さり確認の経過秒。止まっていなければ None。"""
+        return None if self.stopped_at is None else now - self.stopped_at
 
     def _done(self, hit, reason):
         out = Settled(hit, reason, self.seen)
@@ -170,7 +185,7 @@ class HitTracker:
         return out
 
     def update(self, hit, now):
-        """1フレーム分の候補 (Hit または None) を渡す。確定したら Settled、まだなら None。"""
+        """1フレーム分の候補 (Hit または None) を渡す。結末が出たら Settled、まだなら None。"""
         if not self.tracking:
             if hit is None:
                 return None
@@ -179,17 +194,23 @@ class HitTracker:
             self.seen += 1
             self.misses += 1
             if self.misses >= self.grace:
-                return self._done(self.last if self.lost == "last" else None, "lost")
+                if self.lost == "last":
+                    return self._done(self.last, "lost")
+                return self._done(None, "bounced")
             return None
         self.seen += 1
         self.misses = 0
         self.last = hit
         if self.anchor is not None and np.hypot(hit.x - self.anchor[0], hit.y - self.anchor[1]) <= self.px:
             self.run += 1
-        else:
-            self.anchor, self.run = (hit.x, hit.y), 1
-        if self.run >= self.frames:
-            return self._done(hit, "settled")
-        if now - self.start >= self.timeout:
-            return self._done(hit, "timeout")
+        else:  # 動いた: 止まり待ちからやり直し
+            self.anchor, self.run, self.stopped_at = (hit.x, hit.y), 1, None
+        if self.run >= self.frames and self.stopped_at is None:
+            self.stopped_at, self.ever_stopped = now, True
+        if self.stopped_at is not None and now - self.stopped_at >= self.stick:
+            return self._done(hit, "stuck")
+        if not self.ever_stopped and now - self.start >= self.timeout:
+            return self._done(None, "moving")
+        if now - self.start >= self.timeout + self.stick:
+            return self._done(None, "timeout")
         return None

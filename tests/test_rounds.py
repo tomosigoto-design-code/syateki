@@ -15,10 +15,21 @@ FULL = [[0, 0], [W, 0], [W, H], [0, H]]
 POS = {100: (CX, CY), 50: (CX + 100, CY), 10: (CX + 200, CY)}  # 点数ごとの着弾位置
 
 
+# 会場で使う既定値 (fixture で差し替える前に控えておく)
+DEFAULTS = dict(SHOTS_PER_ROUND=config.SHOTS_PER_ROUND, ROUND_TIMEOUT=config.ROUND_TIMEOUT,
+                IDLE_TIMEOUT=config.IDLE_TIMEOUT, RESULT_SEC=config.RESULT_SEC,
+                PRIZE_TIERS=list(config.PRIZE_TIERS), AUTO_ROUND=config.AUTO_ROUND)
+
+
 @pytest.fixture(autouse=True)
 def auto_round(monkeypatch):
-    """ラウンド制は既定で無効なので、このファイルでは有効にして試す。"""
+    """ラウンド制は既定で無効なので、このファイルでは有効にして試す。
+
+    発数・秒数・景品は会場で変わるので、テストは固定値に差し替えて試す (既定値は test_defaults)。
+    """
     monkeypatch.setattr(config, "AUTO_ROUND", True)
+    for k, v in dict(SHOTS_PER_ROUND=5, ROUND_TIMEOUT=40.0, IDLE_TIMEOUT=15.0, RESULT_SEC=10.0).items():
+        monkeypatch.setattr(config, k, v)
     # 景品の点数は会場で変わるので、テストは 300 点で固定して試す
     monkeypatch.setattr(config, "PRIZE_TIERS", [(300, "大きいお菓子", "big"), (0, "お菓子", "normal")])
 
@@ -50,8 +61,24 @@ def shoot(app, score, now):
 
 
 def test_defaults():
-    assert (config.SHOTS_PER_ROUND, config.ROUND_TIMEOUT, config.IDLE_TIMEOUT, config.RESULT_SEC) == \
-        (5, 40.0, 15.0, 10.0)
+    d = DEFAULTS
+    assert d["AUTO_ROUND"] is False
+    assert (d["SHOTS_PER_ROUND"], d["ROUND_TIMEOUT"], d["IDLE_TIMEOUT"], d["RESULT_SEC"]) == \
+        (6, 60.0, None, 15.0)
+    assert d["PRIZE_TIERS"][0][:2] == (350, "大きいお菓子")
+    assert prize_hint(d["PRIZE_TIERS"], d["SHOTS_PER_ROUND"]) == "6発で350点以上 → 大きいお菓子"
+
+
+def test_no_idle_timeout_when_none(tmp_path, monkeypatch):
+    """IDLE_TIMEOUT = None なら、着弾が途切れても開始から ROUND_TIMEOUT までは続く。"""
+    monkeypatch.setattr(config, "IDLE_TIMEOUT", None)
+    app = make(tmp_path)
+    shoot(app, 50, 1.0)
+    assert app.round.time_left(2.0) == pytest.approx(1.0 + config.ROUND_TIMEOUT - 2.0)
+    app.step(bg(), 1.0 + config.ROUND_TIMEOUT - 0.01)
+    assert app.round.state == PLAYING
+    app.step(bg(), 1.0 + config.ROUND_TIMEOUT)
+    assert app.round.state == RESULT and app.round.end_reason == "round_timeout"
 
 
 @pytest.mark.parametrize("score,kind", [(0, "normal"), (299, "normal"), (300, "big"), (999, "big")])
@@ -205,3 +232,40 @@ def test_auto_round_false_keeps_old_behavior(tmp_path, monkeypatch):
         shoot(app, 10, 1.0 + i * 2)
     app.step(bg(), 500.0)                               # 時間がたってもリセットされない
     assert app.game.total_score == 80 and len(app.game.hits) == 8
+
+
+# ---------------------------------------------------------------- U キー
+def test_u_key_toggles_saves_and_restores(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "AUTO_ROUND", False)      # 初期値 OFF
+    app = make(tmp_path)
+    assert app.round is None and not app.auto_round
+    shoot(app, 50, 1.0)
+    assert app.handle_key(ord("u"))                      # ON: リセットして待機
+    assert app.auto_round and app.round.state == ATTRACT and app.game.total_score == 0
+    assert json.loads((tmp_path / "settings.json").read_text())["auto_round"] is True
+    assert make(tmp_path).auto_round                      # 再起動しても ON (config より優先)
+
+    for i in range(config.SHOTS_PER_ROUND):               # ON ならラウンドが動く
+        shoot(app, 10, 2.0 + i)
+    assert app.round.state == RESULT
+    assert app.handle_key(ord("U"))                      # OFF: リセットして通常へ
+    assert app.round is None and app.game.total_score == 0
+    assert json.loads((tmp_path / "settings.json").read_text())["auto_round"] is False
+    assert not make(tmp_path).auto_round
+    for i in range(config.SHOTS_PER_ROUND + 2):           # OFF なら貯まり続ける
+        shoot(app, 10, 20.0 + i * 2)
+    app.step(bg(), 500.0)
+    assert app.game.total_score == 10 * (config.SHOTS_PER_ROUND + 2)
+
+
+def test_round_info_only_when_auto_on(tmp_path, monkeypatch):
+    from syateki import app as app_mod
+    calls = []
+    monkeypatch.setattr(app_mod, "render_projector",
+                        lambda *a, **kw: calls.append(kw) or np.zeros((H, W, 3), np.uint8))
+    app = make(tmp_path)
+    app.step(bg(), 0.0)
+    assert calls[-1]["round_info"]["state"] == "attract"
+    app.handle_key(ord("u"))
+    app.step(bg(), 1.0)
+    assert "round_info" not in calls[-1]

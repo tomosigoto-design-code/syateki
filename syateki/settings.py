@@ -1,6 +1,6 @@
 """会場で変える設定 (settings.json) の読み書き。
 
-{"hit_offset": [dx, dy], "mode": "normal" | "fever"}。片方だけ保存しても他のキーは残す。
+{"hit_offset": [dx, dy], "mode": "normal" | "fever", "auto_round": true | false}。片方だけ保存しても他のキーは残す。
 """
 import json
 import os
@@ -54,3 +54,13 @@ def load_mode(path=config.SETTINGS_FILE):
 
 def save_mode(mode, path=config.SETTINGS_FILE):
     _update(path, mode=mode)
+
+
+def load_auto_round(path=config.SETTINGS_FILE):
+    """無人運用 (ラウンド制) の ON/OFF。保存が無い・不正なら config.AUTO_ROUND。"""
+    v = _read(path).get("auto_round")
+    return v if isinstance(v, bool) else bool(config.AUTO_ROUND)
+
+
+def save_auto_round(on, path=config.SETTINGS_FILE):
+    _update(path, auto_round=bool(on))

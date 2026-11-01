@@ -15,7 +15,8 @@ from .keys import decode_key
 from .render_monitor import BUTTONS, render_monitor
 from .render_projector import render_projector
 from .rounds import RESULT, RoundState
-from .settings import MODES, load_mode, load_offset, save_mode, save_offset
+from .settings import (MODES, load_auto_round, load_mode, load_offset, save_auto_round, save_mode,
+                       save_offset)
 from . import sound
 
 WIN_CAM = "Camera Monitor (Control)"
@@ -74,7 +75,8 @@ class App:
         self.bg_settle_until = 0.0  # この時刻までは背景を撮り続け、検出しない (キャリブ画面の残像対策)
         self.bg_gray = None
         self.game = GameState()
-        self.round = RoundState() if config.AUTO_ROUND else None  # 無人運用のラウンド制
+        # 無人運用のラウンド制 (U キーで ON/OFF、settings.json に保存。None = OFF)
+        self.round = RoundState() if load_auto_round(settings_path) else None
         self.fullscreen = False
         self.running = True
 
@@ -126,6 +128,18 @@ class App:
                 _bgm("bgm_stop")
                 sound.play("bonus_end")
                 print("★ ボーナスタイム終了 (normal に切替)")
+
+    @property
+    def auto_round(self):
+        return self.round is not None
+
+    def toggle_auto_round(self):
+        """無人運用 (ラウンド制) の ON/OFF。切り替えたらリセットして待機 / 通常に戻す。"""
+        on = not self.auto_round
+        save_auto_round(on, self.settings_path)
+        self.reset_game(quiet=True)
+        self.round = RoundState() if on else None
+        print(f"★ 自動 (ラウンド制): {'ON - 最初の着弾で開始' if on else 'OFF - R で手動リセット'}")
 
     def toggle_offset_mode(self):
         if self.offset_step == OFS_IDLE:
@@ -225,6 +239,8 @@ class App:
             self.toggle_offset_mode()
         elif k == "p":
             self.toggle_mode()
+        elif k == "u":
+            self.toggle_auto_round()
         elif k == "f":
             self.toggle_fullscreen()
         return True
@@ -284,7 +300,10 @@ class App:
         self.last_settled = settled
         h = settled.hit
         if h is None:
-            print(f"★ 弾を見失ったので無効 (lost, {settled.frames}f, SETTLE_LOST=drop)")
+            why = {"bounced": "見えなくなった (跳ね返り・一瞬の誤検出)", "moving": "止まらない",
+                   "timeout": "止まったが刺さり続けない"}.get(settled.reason, settled.reason)
+            print(f"★ 候補を無効: {settled.reason} {settled.frames}f - {why}")
+            self.bg_gray = None  # 残像が次の候補にならないよう、背景をすぐ撮り直す
             return
         print(f"★ 着弾確定: {settled.reason} {settled.frames}f / {h.method} 橙{h.orange_px}px / "
               f"補正前({h.raw[0]:.1f}, {h.raw[1]:.1f}) + offset{self.hit_offset} -> ({h.x}, {h.y})")
@@ -295,9 +314,10 @@ class App:
         args = (config.PROJ_W, config.PROJ_H, config.TARGET_CENTER, config.RADII,
                 self.game.total_score, self.game.hits, self.game.cooldown_progress(now),
                 self.calib_step == CALIB_FLASH, now)
-        return _call_projector(args, mode=self.mode, bonus_start=self.game.bonus_start,
-                               bonus_until=self.game.bonus_until,
-                               round_info=None if self.round is None else self.round.info(now))
+        kw = dict(mode=self.mode, bonus_start=self.game.bonus_start, bonus_until=self.game.bonus_until)
+        if self.round is not None:  # round_info は自動 ON のときだけ渡す
+            kw["round_info"] = self.round.info(now)
+        return _call_projector(args, **kw)
 
     def _finish_calibration(self, found, how, now):
         if found is not None:
@@ -399,11 +419,13 @@ class App:
                                  warped_bgr, dart_mask, config.CORNER_LABELS, config.CORNER_COLORS,
                                  settled=self.last_settled,
                                  tracking_frames=self.tracker.seen,
+                                 stick_progress=self.tracker.stick_progress(now),
                                  offset=self.hit_offset, offset_step=self.offset_step,
                                  mode=self.mode, bonus_left=self.game.bonus_left(now),
                                  calib_status=self._calib_status(now),
                                  calib_markers=self.seen_markers,
-                                 round_status=None if self.round is None else self.round.status(now))
+                                 round_status=None if self.round is None else self.round.status(now),
+                                 auto_round=self.auto_round)
         return proj, monitor
 
     def _calib_status(self, now):
@@ -478,6 +500,7 @@ def print_help(demo):
     print(" [I][K] / [J][L]  : 着弾補正を上下 / 左右に2pxずつ (settings.json に保存)")
     print(" [O]              : 着弾補正モード (1発撃って投影画面で実際の位置をクリック)")
     print(" [P]              : 演出モード切替 (normal / fever)")
+    print(" [U]              : 自動 (ラウンド制・無人運用) の ON/OFF")
     print(" [ESC] / [Q]      : 終了")
     print("=========================================================")
 

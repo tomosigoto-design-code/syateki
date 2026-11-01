@@ -114,53 +114,77 @@ def h(x, y):
     return Hit(x, y, "orange", 30, (float(x), float(y)))
 
 
-def test_tracker_waits_until_still():
-    t = HitTracker(frames=3, px=6, timeout=0.5, lost="last")
-    # 上から動いてくる間は確定しない
-    for i, y in enumerate([200, 260, 320]):
-        assert t.update(h(640, y), i * 0.03) is None
-    assert t.tracking and t.seen == 3
-    assert t.update(h(641, 352), 0.09) is None   # 止まった (1/3)
-    assert t.update(h(642, 354), 0.12) is None   # 2/3
-    s = t.update(h(641, 355), 0.15)              # 3/3
-    assert s.reason == "settled" and s.frames == 6 and (s.hit.x, s.hit.y) == (641, 355)
-    assert not t.tracking
+def feed(t, seq, dt=0.03, t0=0.0):
+    """seq を順に渡し、各フレームの結果を返す。"""
+    return [t.update(x, t0 + i * dt) for i, x in enumerate(seq)]
 
 
-def test_tracker_lost_last_and_drop():
-    t = HitTracker(frames=3, lost="last", grace=3)
+def test_tracker_needs_stick_sec_after_stopping():
+    assert (config.STICK_SEC, config.SETTLE_LOST) == (0.6, "drop")
+    t = HitTracker(frames=3, px=6, timeout=0.5, grace=3, stick=0.6)
+    # 上から動いてきて (0〜0.06)、0.09 から止まる。3フレーム目 (0.15) で「止まった」
+    out = feed(t, [h(640, 200), h(640, 260), h(640, 320), h(641, 352), h(642, 354), h(641, 355)])
+    assert all(o is None for o in out) and t.stick_progress(0.15) == pytest.approx(0.0)
+    s = None
+    now = 0.15
+    while s is None:                                   # 同じ位置に見え続ける
+        now += 0.03
+        s = t.update(h(641 + int(now * 10) % 3, 354), now)
+    assert s.reason == "stuck" and s.valid and now == pytest.approx(0.75)
+    assert (s.hit.x, s.hit.y) != (640, 200) and not t.tracking
+
+
+def test_tracker_one_frame_blip_is_bounced():
+    t = HitTracker(frames=3, grace=3)
     assert t.update(None, 0.0) is None and not t.tracking
-    assert t.update(h(600, 300), 0.0) is None
-    assert t.update(None, 0.03) is None and t.update(None, 0.06) is None  # 猶予中
-    s = t.update(None, 0.09)  # 3フレーム見えない → lost
-    assert s.reason == "lost" and s.frames == 4 and (s.hit.x, s.hit.y) == (600, 300)
+    out = feed(t, [h(600, 300), None, None, None])
+    assert out[:3] == [None, None, None]
+    assert out[3].reason == "bounced" and out[3].hit is None and not out[3].valid
+    assert t.update(None, 0.2) is None                 # 追跡は終わっている
 
-    t = HitTracker(frames=3, lost="drop", grace=3)
-    t.update(h(600, 300), 0.0)
-    for i in range(2):
-        assert t.update(None, 0.03 * (i + 1)) is None
-    s = t.update(None, 0.09)
-    assert s.reason == "lost" and s.hit is None
-    assert t.update(None, 0.12) is None  # 追跡は終わっている
+
+def test_tracker_stop_then_vanish_is_bounced():
+    """止まった後、刺さり確認中に消えた (跳ね返り) → 無効。"""
+    t = HitTracker(frames=3, grace=3, stick=0.6)
+    out = feed(t, [h(600, 300)] * 8 + [None] * 3)
+    assert all(o is None for o in out[:-1]) and out[-1].reason == "bounced"
 
 
 def test_tracker_grace_keeps_tracking_through_flicker():
-    """飛行中に1〜2フレーム欠けても lost にせず、止まった位置で settled。"""
+    """飛行中や刺さり確認中に1〜2フレーム欠けても、無効にせず追跡を続ける。"""
     assert config.SETTLE_GRACE == 3
-    t = HitTracker(frames=3, px=6, timeout=0.5, lost="last", grace=3)
+    t = HitTracker(frames=3, px=6, timeout=0.5, grace=3, stick=0.6)
     seq = [h(640, 150), None, h(640, 260), None, None,   # ちらつき + 大きく飛ぶ
            h(641, 350), None, h(642, 352), h(641, 353)]   # 止まる (欠けても run は保つ)
-    out = [t.update(x, i * 0.03) for i, x in enumerate(seq)]
-    assert all(o is None for o in out[:-1])
-    s = out[-1]
-    assert s.reason == "settled" and (s.hit.x, s.hit.y) == (641, 353) and s.frames == len(seq)
+    seq += ([h(641, 353)] * 5 + [None, None]) * 3          # 刺さり確認中のちらつき
+    seq += [h(641, 353)] * 3
+    out = feed(t, seq)
+    s = [o for o in out if o is not None]
+    assert len(s) == 1 and s[0].reason == "stuck" and (s[0].hit.x, s[0].hit.y) == (641, 353)
 
 
-def test_tracker_timeout_uses_current_position():
+def test_tracker_moving_is_rejected():
     t = HitTracker(frames=3, px=6, timeout=0.5)
-    y, now = 100, 0.0
-    s = None
+    y, now, s = 100, 0.0, None
     while s is None:
         s = t.update(h(640, y), now)
-        y, now = y + 20, now + 0.1   # 動き続ける
-    assert s.reason == "timeout" and s.hit.y == 200 and s.frames == 6
+        y, now = y + 20, now + 0.1                     # 動き続ける
+    assert s.reason == "moving" and s.hit is None and s.frames == 6
+
+
+def test_tracker_stops_and_moves_again_times_out():
+    """止まったり動いたりを繰り返して刺さり続けないもの → timeout で無効。"""
+    t = HitTracker(frames=3, px=6, timeout=0.5, stick=0.6)
+    seq = []
+    for k in range(20):                                # 0.3秒止まっては 30px 動く
+        seq += [h(640 + 30 * k, 300)] * 10
+    out = feed(t, seq)
+    s = [o for o in out if o is not None][0]
+    assert s.reason == "timeout" and s.hit is None
+    assert out.index(s) * 0.03 == pytest.approx(1.1, abs=0.04)
+
+
+def test_tracker_last_mode_confirms_lost():
+    t = HitTracker(frames=3, lost="last", grace=3)
+    s = feed(t, [h(600, 300), None, None, None])[-1]
+    assert s.reason == "lost" and (s.hit.x, s.hit.y) == (600, 300)
