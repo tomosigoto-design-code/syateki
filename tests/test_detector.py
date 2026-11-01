@@ -12,8 +12,11 @@ BLUE = (200, 80, 20)     # HSV H≒108
 ORANGE = (0, 160, 255)   # HSV H≒19, 背景より明るい
 
 
+R100, R50, R10 = config.RADII   # TARGET_SCALE に連動
+
+
 @pytest.mark.parametrize("d,score", [
-    (0, 100), (60, 100), (60.01, 50), (150, 50), (150.01, 10), (260, 10), (260.01, 0), (500, 0),
+    (0, 100), (R100, 100), (R100 + 0.01, 50), (R50, 50), (R50 + 0.01, 10), (R10, 10), (R10 + 0.01, 0), (500, 0),
 ])
 def test_score_boundaries(d, score):
     assert score_for_distance(d) == score
@@ -21,8 +24,8 @@ def test_score_boundaries(d, score):
 
 def test_score_for_point():
     assert score_for_point(CX, CY) == 100
-    assert score_for_point(CX + 150, CY) == 50
-    assert score_for_point(CX, CY + 261) == 0
+    assert score_for_point(CX + R50, CY) == 50
+    assert score_for_point(CX, CY + R10 + 1) == 0
 
 
 def background():

@@ -6,7 +6,7 @@ mode="fever" ではブルがパチンコ風に派手になり、2倍タイム(bo
 静的な部分(背景・ボード・スコアバーの枠・四隅マーカー)はサイズごとにキャッシュする。
 
 カメラ誤検出対策:
-- 中心から QUIET_R 以内は、命中演出を除いて完全に静止させる(外で動くのはスコアバーとブルの祝祭演出だけ、マスクで保証)。
+- 中心から静止半径(ボード外縁 + QUIET_MARGIN, _quiet_r)以内は、命中演出を除いて完全に静止させる(外で動くのはスコアバーとブルの祝祭演出だけ、マスクで保証)。
 - 命中演出は FX_END 秒以内にすべて消す(クールダウン 1.2 秒 + カメラ遅延より前)。
 - 判定円内で動く色は白・黒・グレーと、ボード自身の色を白へ寄せたものだけ(弾の青・橙を出さない)。
 - 全画面フラッシュはしない(カメラの露出が揺れるため)。
@@ -50,7 +50,7 @@ READY_GREEN = (90, 190, 70)
 # キャリブ用の四隅マーカー色(変更禁止)
 CORNER_COLORS = [(0, 0, 255), (0, 255, 0), (255, 140, 0), (0, 255, 255)]
 
-QUIET_R = 300        # この半径以内は命中演出以外を静止させる
+QUIET_MARGIN = 14    # 静止させる円 = ボード外縁 + これ(基準の大きさで 286 + 14 = 300)
 FX_END = 0.8         # 命中演出が完全に消える時刻(秒)。0.85 未満
 COUNT_UP = 0.35      # スコアのカウントアップ(判定円の外)
 SS = 2               # ボードを描くときの超解像倍率
@@ -70,6 +70,11 @@ def _board_rings(radii):
     }
 
 
+def _quiet_r(radii):
+    """命中演出以外を静止させる半径。ボードの大きさ(TARGET_SCALE)に連動する。"""
+    return _board_rings(radii)["edge"] + QUIET_MARGIN
+
+
 def _text_center(img, text, cx, cy, font, scale, col, thick):
     (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
     cv2.putText(img, text, (int(round(cx - tw / 2)), int(round(cy + th / 2))), font, scale, col, thick, AA)
@@ -77,9 +82,9 @@ def _text_center(img, text, cx, cy, font, scale, col, thick):
 
 def _bar_rect(w, h, center, radii):
     """スコアバー (x0, y0, x1, y1)。ボードの左に置く。"""
-    edge = _board_rings(radii)["edge"]
-    x0 = 72
-    x1 = max(x0 + 150, min(x0 + 214, center[0] - max(edge, QUIET_R) - 28))
+    right = center[0] - _quiet_r(radii) - 28        # 静止円の手前まで
+    x0 = max(30, min(72, right - 214))               # ボードが大きいときは左端へ寄せる
+    x1 = max(x0 + 150, min(x0 + 214, right))
     y0 = h // 2 - 118
     return x0, y0, x1, y0 + 156
 
@@ -168,9 +173,9 @@ def _build_static(w, h, center, radii):
     _text_center(bg, "C: AUTO ALIGN   /   RIGHT CLICK: RESET   /   F: FULLSCREEN",
                  w // 2, h - 18, SIMPLEX, 0.38, (88, 89, 92), 1)
 
-    # 判定円の内側 (QUIET_R) のマスク。スコアバーの描画がはみ出しても戻す
+    # 静止円の内側のマスク。外側の演出がはみ出しても戻す
     quiet = np.zeros((h, w), np.uint8)
-    cv2.circle(quiet, center, QUIET_R, 255, -1)
+    cv2.circle(quiet, center, _quiet_r(radii), 255, -1)
 
     # 得点帯のマスク(命中時に一瞬だけ明るくする)。ボードの外接正方形で持つ
     r10 = radii[2]
@@ -369,7 +374,7 @@ def _bull_fade(age):
     return 1.0 if age < BULL_END - 0.5 else max(0.0, (BULL_END - age) / 0.5)
 
 
-def _draw_rays(frame, center, age):
+def _draw_rays(frame, center, age, qr):
     """ボードの外周から外へ伸びる光の筋。ゆっくり回りながら消える。"""
     a = min(1.0, age / 0.12) * max(0.0, 1 - age / 1.6) ** 1.5
     if a <= 0:
@@ -382,7 +387,7 @@ def _draw_rays(frame, center, age):
         th = rot + (i + 0.5) * 2 * math.pi / n     # ボードの数字の間から出る
         half = math.radians(0.75 if i % 2 == 0 else 0.4)
         base = GOLD if i % 2 == 0 else (215, 235, 245)
-        steps = np.linspace(QUIET_R + 2, 700 if i % 2 == 0 else 520, 13)
+        steps = np.linspace(qr + 2, qr + (400 if i % 2 == 0 else 220), 13)
         for j in range(len(steps) - 1):
             r0, r1 = steps[j], steps[j + 1]
             k = (1 - j / (len(steps) - 1)) ** 1.6
@@ -410,10 +415,10 @@ def _draw_confetti(frame, center, radii, hit, age, n=110, palette=CONFETTI, a=No
     sway = 14 * np.sin(rng.uniform(4, 8, n) * age + rng.uniform(0, 6.3, n))
     xs = center[0] + np.cos(ang) * (r0 + spd * f) + sway
     ys = center[1] + np.sin(ang) * (r0 + spd * f) + np.minimum(0.5 * g * age * age, fall * age)
-    _draw_flakes(frame, rng, xs, ys, age, palette, a, center)
+    _draw_flakes(frame, rng, xs, ys, age, palette, a, center, _quiet_r(radii))
 
 
-def _draw_flakes(frame, rng, xs, ys, age, palette, a, center=None):
+def _draw_flakes(frame, rng, xs, ys, age, palette, a, center=None, qr=0):
     """紙吹雪の小片(回転しながら裏返る長方形)を描く。center を渡すと判定円の中の分は描かない(どうせ戻すので)。"""
     n = len(xs)
     spin = rng.uniform(5, 12, n) * age + rng.uniform(0, 6.3, n)
@@ -423,7 +428,7 @@ def _draw_flakes(frame, rng, xs, ys, age, palette, a, center=None):
     h, w = frame.shape[:2]
     keep = (xs > -10) & (xs < w + 10) & (ys > -10) & (ys < h + 10)
     if center is not None:
-        keep &= np.hypot(xs - center[0], ys - center[1]) > QUIET_R - 12
+        keep &= np.hypot(xs - center[0], ys - center[1]) > qr - 12
     idx = np.nonzero(keep)[0]
     if len(idx) == 0:
         return
@@ -445,8 +450,7 @@ def _draw_telop(frame, w, h, center, radii, age, streak):
     a = _bull_fade(age)
     if a <= 0:
         return
-    edge = _board_rings(radii)["edge"]
-    x0 = center[0] + max(edge, QUIET_R) + 18
+    x0 = center[0] + _quiet_r(radii) + 18
     x1 = w - 36
     if x1 - x0 < 160:
         return
@@ -464,7 +468,8 @@ def _draw_telop(frame, w, h, center, radii, age, streak):
     if age < 0.06:
         return
     t = age - 0.06
-    sc = 1.9 * (1 + 0.45 * math.exp(-t * 14) * math.cos(t * 26))   # スケールインして少し揺れる
+    base = min(1.9, 1.9 * (x1 - x0 - 34) / cv2.getTextSize("BULL!", DUPLEX, 1.9, 3)[0][0])   # 帯の幅に収める
+    sc = base * (1 + 0.45 * math.exp(-t * 14) * math.cos(t * 26))   # スケールインして少し揺れる
     dx = 5 * math.exp(-t * 5) * math.sin(t * 30)
     mx = (x0 + x1) / 2 + 3 + dx
     _text_center(frame, "BULL!", mx, cy - 8, DUPLEX, sc, _scale(INK, a), 9)
@@ -628,9 +633,13 @@ def _prewarm_glyphs():
     for n in range(2, 7):
         _small_mask(f"×{n}", 96)
     _small_mask("×2", 130)
+    for text, px in (("ダーツを撃って", 40), ("スタート!", 54), ("大きいお菓子", 40), ("GET!", 46),   # ラウンド表示
+                     ("お菓子をどうぞ", 32), ("受付でお菓子を受け取ってね", 20), ("次の人どうぞ", 22),
+                     ("5発で高得点を狙え", 24), ("→ 大きいお菓子", 24)):
+        _jp_mask(text, px, "")
 
 
-def _draw_sunburst(frame, center, age, wedges=True):
+def _draw_sunburst(frame, center, age, qr, wedges=True):
     """回転する放射バースト(色の帯)+ 虹色に流れる細い光の筋。円内は後で静的画像に戻る。"""
     a = min(1.0, age / 0.1) * _fever_fade(age)
     if a <= 0:
@@ -655,20 +664,20 @@ def _draw_sunburst(frame, center, age, wedges=True):
         th = -1.4 * age + i * 2 * math.pi / m
         c, s_ = math.cos(th), math.sin(th)
         for j in range(5):
-            r0, r1 = QUIET_R + 6 + j * 110, QUIET_R + 6 + (j + 1) * 110
+            r0, r1 = qr + 6 + j * 110, qr + 6 + (j + 1) * 110
             col = _hue(i * 6 + j * 30 - age * 260, 0.9 * a * (1 - j / 6))
             cv2.line(lay, (int(cx + c * r0), int(cy + s_ * r0)), (int(cx + c * r1), int(cy + s_ * r1)),
                      col, 2 if i % 3 else 3, AA)
 
 
-def _draw_stars(frame, center, hit, age, n=60):
+def _draw_stars(frame, center, hit, age, qr, n=60):
     """星のきらめき(4本のとげの星が瞬く)。円の外の固定位置。"""
     a = _fever_fade(age)
     rng = np.random.default_rng((int(hit.t * 1000) + 7) & 0xFFFFFFFF)
     h, w = frame.shape[:2]
     pts = rng.uniform((0, 0), (w, h), (160, 2))
     d = np.hypot(pts[:, 0] - center[0], pts[:, 1] - center[1])
-    pts = pts[d > QUIET_R + 20][:n]
+    pts = pts[d > qr + 20][:n]
     ph = rng.uniform(0, 6.3, len(pts))
     om = rng.uniform(7, 14, len(pts))
     sz = rng.uniform(6, 15, len(pts))
@@ -716,12 +725,12 @@ def _draw_marquee(frame, age, step=30):
             cv2.circle(frame, p, 4, _scale((60, 60, 70), a), -1, AA)
 
 
-def _draw_jackpot(frame, w, h, center, age):
+def _draw_jackpot(frame, w, h, center, age, qr):
     """巨大な縦書き「大当たり!!」。1文字ずつドーンと出て、揺れて、虹色に流れる。"""
     a = _fever_fade(age)
     if a <= 0:
         return
-    x_l = center[0] + QUIET_R + 10
+    x_l = center[0] + qr + 10
     cx = (x_l + w - 30) / 2
     glyphs = _jackpot_glyphs(118)
     n = len(glyphs)
@@ -746,7 +755,7 @@ def _draw_jackpot(frame, w, h, center, age):
         _paste_mask(frame, m, e, cx + shake, y_c + jitter, sc * pop, fill, _scale((10, 10, 14), a))
 
 
-def _draw_fever_telops(frame, w, h, center, age, streak):
+def _draw_fever_telops(frame, w, h, center, age, streak, qr):
     """CONGRATULATIONS(左上)と ×2 / +100(左下)。"""
     a = _fever_fade(age)
     if a <= 0:
@@ -754,8 +763,14 @@ def _draw_fever_telops(frame, w, h, center, age, streak):
     if age > 0.45:
         t = age - 0.45
         txt = "CONGRATULATIONS"
-        (tw, th), _ = cv2.getTextSize(txt, DUPLEX, 0.9, 2)
         x0, y0 = 70, 96
+        dy = max(0, center[1] - (y0 + 48))                # 帯の下端で、静止円にかからない幅に収める
+        room = center[0] - math.sqrt(max(0, qr * qr - dy * dy)) - 10 - x0 if dy < qr else w
+        fs = 0.9
+        tw = cv2.getTextSize(txt, DUPLEX, fs, 2)[0][0]
+        if tw + 36 > room:
+            fs = max(0.5, fs * (room - 36) / tw)
+            tw = cv2.getTextSize(txt, DUPLEX, fs, 2)[0][0]
         wipe = min(1.0, t / 0.2)
         bw = int((tw + 36) * wipe)
         cv2.rectangle(frame, (x0, y0), (x0 + bw, y0 + 48), _scale((20, 14, 26), a), -1)
@@ -766,8 +781,8 @@ def _draw_fever_telops(frame, w, h, center, age, streak):
             x = x0 + 18
             for j, ch in enumerate(txt):
                 bob = int(4 * math.sin(age * 12 - j * 0.6))
-                cv2.putText(frame, ch, (x, y0 + 34 + bob), DUPLEX, 0.9, _hue(j * 12 + age * 250, a), 2, AA)
-                x += cv2.getTextSize(ch, DUPLEX, 0.9, 2)[0][0]
+                cv2.putText(frame, ch, (x, y0 + 34 + bob), DUPLEX, fs, _hue(j * 12 + age * 250, a), 2, AA)
+                x += cv2.getTextSize(ch, DUPLEX, fs, 2)[0][0]
     if age > 0.8:
         t = age - 0.8
         txt = f"×{streak}" if streak >= 2 else "+100"
@@ -791,10 +806,11 @@ def _draw_fever_badge(frame, w, h, center, radii):
 
 def _draw_fever_outer(frame, w, h, center, radii, hit, age, streak, dragon=False, fire=False):
     """dragon=True(2倍タイム中)は龍と炎が主役なので、ブルの外側演出は省く(描画時間・輝度対策)。"""
+    qr = _quiet_r(radii)
     if not dragon:
-        _draw_sunburst(frame, center, age, wedges=False)   # 背景の色面はランプのペカりが担う(平均輝度対策)
+        _draw_sunburst(frame, center, age, qr, wedges=False)   # 背景の色面はランプのペカりが担う(平均輝度対策)
     if not dragon:
-        _draw_stars(frame, center, hit, age)
+        _draw_stars(frame, center, hit, age, qr)
         _draw_confetti(frame, center, radii, hit, age, n=140 if fire else 200, palette=RAINBOW, a=_fever_fade(age),
                        seed=11)
     if not dragon:
@@ -802,14 +818,14 @@ def _draw_fever_outer(frame, w, h, center, radii, hit, age, streak, dragon=False
     if not dragon:
         _draw_marquee(frame, age)
     if not dragon:
-        _draw_fever_telops(frame, w, h, center, age, streak)
-        _draw_jackpot(frame, w, h, center, age)
+        _draw_fever_telops(frame, w, h, center, age, streak, qr)
+        _draw_jackpot(frame, w, h, center, age, qr)
 
 
 # ---------------------------------------------------------------- bonus (fever の2倍タイム: 龍 + 炎のリング)
 # bonus_start <= now < bonus_until の間だけ。龍・炎・テロップはすべて半径300の外(描いた後に円内を静的画像へ戻す)。
 DRAGON_T = 3.0           # 発動演出(入場・ブレス・印・稲妻・テロップ)の長さ。龍そのものは bonus_until まで舞う
-DRAGON_R0 = 350          # 龍が回る軌道の半径
+DRAGON_GAP = 50          # 龍が回る軌道の半径 = 静止半径 + これ(基準の大きさで 350)
 DRAGON_N = 44            # 胴の節の数
 DRAGON_EXIT = 1.0        # 終了何秒前から画面外へ去るか
 FIRE_FADE = 1.0          # 終了何秒前から炎が弱まるか
@@ -834,20 +850,20 @@ def _dragon_phase(t, total):
     return phi, PHI_START + OMEGA * te
 
 
-def _dragon_path(center, t, total, sgn):
+def _dragon_path(center, t, total, sgn, qr):
     """龍の頭が時刻 t(配列)にいる位置。外から渦を巻いて入り、外周を回り、最後は渦を巻いて画面外へ去る。
     sgn=±1 でうねりを逆位相にして、2匹が絡み合うように交差させる。"""
     t = np.asarray(t, np.float64)
     phi, _ = _dragon_phase(t, total)
     te = total - DRAGON_EXIT
-    r = DRAGON_R0 + 650 * np.clip((0.45 - t) / 0.45, 0, None) ** 1.2 + 900 * np.maximum(0.0, t - te) ** 1.4
+    r = qr + DRAGON_GAP + 650 * np.clip((0.45 - t) / 0.45, 0, None) ** 1.2 + 900 * np.maximum(0.0, t - te) ** 1.4
     r = r + sgn * 17 * np.sin(t * 9)
     return np.stack([center[0] + np.cos(phi) * r, center[1] + np.sin(phi) * r], 1)
 
 
-def _dragon_geom(center, t, total, sgn, size, n=DRAGON_N, seg=18.0):
+def _dragon_geom(center, t, total, sgn, size, qr, n=DRAGON_N, seg=18.0):
     """胴の節。頭の過去の軌跡を一定の間隔(弧長 seg)でたどる(列車のように、どの速さでも胴の長さは一定)。"""
-    hist = _dragon_path(center, t - np.arange(0, 220) * 0.008, total, sgn)
+    hist = _dragon_path(center, t - np.arange(0, 220) * 0.008, total, sgn, qr)
     d = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(hist, axis=0).T))])
     s_ = np.arange(n + 1) * seg * size
     P = np.stack([np.interp(s_, d, hist[:, 0]), np.interp(s_, d, hist[:, 1])], 1)
@@ -1036,10 +1052,10 @@ def _draw_pearl(frame, glow, gs, p, t):
     cv2.circle(frame, (x - 4, y - 4), 4, (245, 252, 255), -1, AA)
 
 
-def _trail_points(center, t, total, sgn, n, seed):
+def _trail_points(center, t, total, sgn, n, seed, qr):
     """頭が通った跡の光の粒の位置(過去の頭の位置 + 時刻で決まる揺らぎ)。"""
     lag = np.arange(1, n + 1) * 0.045
-    pts = _dragon_path(center, t - lag, total, sgn)
+    pts = _dragon_path(center, t - lag, total, sgn, qr)
     j = np.arange(n) + seed
     jit = np.stack([np.sin(j * 12.9898 + t * 3), np.cos(j * 78.233 + t * 2)], 1) * (8 + lag[:, None] * 60)
     return pts + jit
@@ -1058,7 +1074,7 @@ def _draw_trail(frame, glow, gs, pts):
                        -1)
 
 
-def _draw_lightning(frame, glow, gs, center, t, seed, size=(1280, 720)):
+def _draw_lightning(frame, glow, gs, center, t, seed, size, qr):
     """発動中に何度か走る稲妻(円の外、画面の縁からボードの縁へ)。"""
     w, h = size
     for b, (t0, dur) in enumerate(((0.28, 0.16), (0.95, 0.13), (1.7, 0.15), (2.4, 0.12))):
@@ -1067,7 +1083,7 @@ def _draw_lightning(frame, glow, gs, center, t, seed, size=(1280, 720)):
         a = 1.0 if t < t0 + dur * 0.5 else 0.85 if int(t * 40) % 2 else 0.5     # ちらつき
         rng = np.random.default_rng(seed + b)
         ang = rng.uniform(0, 2 * math.pi)
-        end = np.array([center[0] + math.cos(ang) * (QUIET_R + 20), center[1] + math.sin(ang) * (QUIET_R + 20)])
+        end = np.array([center[0] + math.cos(ang) * (qr + 20), center[1] + math.sin(ang) * (qr + 20)])
         start = np.array([center[0] + math.cos(ang) * 900, center[1] + math.sin(ang) * 900])
         start = np.clip(start, (0, 0), (w - 1, h - 1))
         n = 11
@@ -1214,16 +1230,16 @@ def _shake(t):
     return (int(e * math.sin(tau * 61)), int(e * math.cos(tau * 47)))
 
 
-def _draw_dragons(frame, center, t, total, intro, seed, glow):
+def _draw_dragons(frame, center, t, total, intro, seed, glow, qr):
     """2匹の龍(赤龍が宝珠を追い、金龍が絡み合うように続く)、光跡、ブレス、稲妻。
     先に低解像度のグロー(輪郭の光・宝珠・ブレス・稲妻)を加算してから、本体を上に描く。"""
     h, w = frame.shape[:2]
     gs = glow.shape[1] / w
     if not 0 <= t < total:
         return
-    red = _dragon_geom(center, t, total, 1, 1.0)
-    gold = _dragon_geom(center, t - 0.2, total, -1, 0.82)
-    pearl = _dragon_path(center, np.array([t + 0.16]), total, 0)[0]
+    red = _dragon_geom(center, t, total, 1, 1.0, qr)
+    gold = _dragon_geom(center, t - 0.2, total, -1, 0.82, qr)
+    pearl = _dragon_path(center, np.array([t + 0.16]), total, 0, qr)[0]
     breath = intro and 0.35 < t < 2.2
     kb = min(1.0, (t - 0.35) / 0.15) * min(1.0, (2.2 - t) / 0.2) if breath else 0.0
     for (P, tang, nrm, width), pal in ((gold, PAL_GOLD), (red, PAL_RED)):
@@ -1231,8 +1247,8 @@ def _draw_dragons(frame, center, t, total, intro, seed, glow):
         poly = np.concatenate([P[:DRAGON_N] + Wn, (P[:DRAGON_N] - Wn)[::-1]]) * gs
         cv2.fillPoly(glow, [_i32(poly)], pal["glow"])
     n_r, n_g = (12, 8) if intro else (9, 6)
-    tr_r = _trail_points(center, t, total, 1, n_r, 0)
-    tr_g = _trail_points(center, t - 0.2, total, -1, n_g, 50)
+    tr_r = _trail_points(center, t, total, 1, n_r, 0, qr)
+    tr_g = _trail_points(center, t - 0.2, total, -1, n_g, 50, qr)
     _draw_trail(None, glow, gs, tr_r)
     _draw_trail(None, glow, gs, tr_g)
     _draw_pearl(None, glow, gs, pearl, t)
@@ -1240,7 +1256,7 @@ def _draw_dragons(frame, center, t, total, intro, seed, glow):
         P, tang, nrm, width = red
         _draw_breath(None, glow, gs, _mouth(P, tang, nrm, 1.75), _breath_dir(tang, nrm), t, kb)
     if intro:
-        _draw_lightning(None, glow, gs, center, t, seed, (w, h))
+        _draw_lightning(None, glow, gs, center, t, seed, (w, h), qr)
     glow = cv2.GaussianBlur(glow, (0, 0), 2.2)
     bx, by, bw, bh = cv2.boundingRect(cv2.cvtColor(glow, cv2.COLOR_BGR2GRAY))   # 光っている範囲だけ拡大・加算
     if bw and bh:
@@ -1258,7 +1274,7 @@ def _draw_dragons(frame, center, t, total, intro, seed, glow):
         P, tang, nrm, width = red
         _draw_breath(frame, None, gs, _mouth(P, tang, nrm, 1.75), _breath_dir(tang, nrm), t, kb)
     if intro:
-        _draw_lightning(frame, None, gs, center, t, seed, (w, h))
+        _draw_lightning(frame, None, gs, center, t, seed, (w, h), qr)
 
 
 def _fire_cover(t, total):
@@ -1278,20 +1294,20 @@ def _bonus_level(now, bonus_start, bonus_until):
     return max(0.0, k)
 
 
-def _draw_fire_ring(frame, center, now, k, cover=None, glow=None, gs=0.25):
+def _draw_fire_ring(frame, center, now, k, qr, cover=None, glow=None, gs=0.25):
     """的の外周を囲む炎のリング(ノイズで揺らぐ炎の舌 + 火の粉 + 弱いグロー)。半分の解像度で描いて拡大・加算。"""
     if k <= 0:
         return
     cx, cy = center
     H, W = frame.shape[:2]
-    RO = QUIET_R + 95
+    RO = qr + 95
     x0, y0, x1, y1 = max(0, cx - RO), max(0, cy - RO), min(W, cx + RO), min(H, cy + RO)
     x0, y0 = x0 + (x1 - x0) % 2, y0 + (y1 - y0) % 2
     S = 0.5
     lay = np.zeros(((y1 - y0) // 2, (x1 - x0) // 2, 3), np.uint8)
     ox, oy = (cx - x0) * S, (cy - y0) * S
     M = 40
-    r0 = (QUIET_R + 2) * S
+    r0 = (qr + 2) * S
     layers = (((20, 30, 170), 1.0, 0.8), ((10, 110, 250), 0.66, 0.58), ((120, 230, 255), 0.34, 0.36))
     i = np.arange(M)
     th = i * 2 * math.pi / M + 0.03 * np.sin(now * 3 + i)
@@ -1539,23 +1555,25 @@ def _jp_text(frame, text, cx, cy, px, col, fallback, maxw=280, scale=1.0):
     _paste_mask(frame, m, e, cx, cy, sc, col, (12, 12, 14))
 
 
-def _round_cx(w, center):
-    return (center[0] + QUIET_R + 10 + w - 30) / 2
+def _round_strip(w, center, radii):
+    """右側の帯(静止円の外)の中心 x と幅。"""
+    x0 = center[0] + _quiet_r(radii) + 10
+    return (x0 + w - 30) / 2, (w - 30) - x0
 
 
-def _draw_round_attract(frame, w, h, center, info, now):
+def _draw_round_attract(frame, w, h, center, radii, info, now):
     """呼び込み(右側の帯、ゆっくり脈打つ)。"""
-    cx = _round_cx(w, center)
+    cx, sw = _round_strip(w, center, radii)
     k = 0.9 + 0.1 * math.sin(now * 2.4)
-    _jp_text(frame, "ダーツを撃って", cx, h * 0.24, 40, _scale(WHITE, k), "SHOOT A DART")
-    _jp_text(frame, "スタート!", cx, h * 0.24 + 58, 54, _scale(GOLD, k), "TO START!")
+    _jp_text(frame, "ダーツを撃って", cx, h * 0.24, 40, _scale(WHITE, k), "SHOOT A DART", maxw=sw)
+    _jp_text(frame, "スタート!", cx, h * 0.24 + 58, 54, _scale(GOLD, k), "TO START!", maxw=sw)
     hint = info.get("hint") or "5発で高得点を狙え"
     lines = [s.strip() for s in hint.split("→")] if "→" in hint else [hint]
     if len(lines) == 2:
         lines[1] = "→ " + lines[1]
     y = h * 0.24 + 128
     for ln in lines:
-        _jp_text(frame, ln, cx, y, 24, (230, 230, 230), "AIM FOR A HIGH SCORE")
+        _jp_text(frame, ln, cx, y, 24, (230, 230, 230), "AIM FOR A HIGH SCORE", maxw=sw)
         y += 38
     # 弾のアイコンで「5発」を見せる
     n = int(info.get("max_shots") or 5)
@@ -1597,10 +1615,10 @@ def _draw_round_result(frame, w, h, center, radii, info, total_score, now):
     t0 = info.get("result_started")
     age = now - t0 if t0 is not None else 10.0
     big = info.get("prize_kind") == "big"
-    cx = _round_cx(w, center)
+    cx, sw = _round_strip(w, center, radii)
     if big and 0 <= age < BULL_END:
         fake = Hit(center[0], center[1], 100, t0)
-        _draw_rays(frame, center, age)
+        _draw_rays(frame, center, age, _quiet_r(radii))
         _draw_confetti(frame, center, radii, fake, age)
     pop = 1 + 0.5 * math.exp(-max(0.0, age) * 9) * abs(math.cos(age * 14)) if big else 1.0
     _text_center(frame, "SCORE", cx, h * 0.16, DUPLEX, 0.8, (200, 200, 200), 1)
@@ -1611,11 +1629,11 @@ def _draw_round_result(frame, w, h, center, radii, info, total_score, now):
     label = info.get("prize_label")
     if big:
         k = 0.85 + 0.15 * math.sin(now * 5)
-        _jp_text(frame, label or "大きいお菓子", cx, h * 0.45, 40, _scale(GOLD, k), "BIG PRIZE")
-        _jp_text(frame, "GET!", cx, h * 0.45 + 52, 46, _scale(GOLD, k), "GET!")
+        _jp_text(frame, label or "大きいお菓子", cx, h * 0.45, 40, _scale(GOLD, k), "BIG PRIZE", maxw=sw)
+        _jp_text(frame, "GET!", cx, h * 0.45 + 52, 46, _scale(GOLD, k), "GET!", maxw=sw)
     else:
-        _jp_text(frame, "お菓子をどうぞ", cx, h * 0.47, 32, WHITE, "ENJOY A SNACK")
-    _jp_text(frame, "受付でお菓子を受け取ってね", cx, h * 0.62, 20, (225, 225, 225), "GET IT AT THE DESK")
+        _jp_text(frame, "お菓子をどうぞ", cx, h * 0.47, 32, WHITE, "ENJOY A SNACK", maxw=sw)
+    _jp_text(frame, "受付でお菓子を受け取ってね", cx, h * 0.62, 20, (225, 225, 225), "GET IT AT THE DESK", maxw=sw)
     nxt = info.get("next_in")
     if nxt is None:
         nxt = info.get("time_left")      # app は RESULT 中、次のラウンドまでの残り秒を time_left で渡す
@@ -1627,7 +1645,7 @@ def _draw_round_result(frame, w, h, center, radii, info, total_score, now):
     (nw, _), _ = cv2.getTextSize(num, DUPLEX, 0.7, 2)
     gap = 8
     x0 = cx - (m.shape[1] + gap + nw) / 2                 # 文字と秒数をまとめて中央寄せ
-    _jp_text(frame, "次の人どうぞ", x0 + m.shape[1] / 2, h * 0.70, 22, (230, 230, 230), "NEXT PLAYER")
+    _jp_text(frame, "次の人どうぞ", x0 + m.shape[1] / 2, h * 0.70, 22, (230, 230, 230), "NEXT PLAYER", maxw=sw)
     _text_center(frame, num, x0 + m.shape[1] + gap + nw / 2, h * 0.70, DUPLEX, 0.7, GOLD, 2)
 
 
@@ -1657,6 +1675,7 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
     radii = tuple(int(r) for r in radii)
     st = _get_static(w, h, center, radii)
     base = st["bg"]
+    qr = _quiet_r(radii)
     frame = base.copy()
 
     # 判定円の外で変わるもの(ブルの祝祭・スコアバー)。はみ出しても円内は静的画像に戻す
@@ -1668,14 +1687,14 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
     box = _bar_rect(w, h, center, radii)
     rstate = round_info.get("state") if round_info else None
     outer = bool(bull) or bonus or rstate in ("attract", "result")
-    if bull:
+    if bull and rstate != "result":     # 結果画面中は結果の演出が主役(ブルの外側演出は出さない)
         hit, age, streak = bull
         if fever:
             # 2倍タイム中は龍が舞っているので、バースト・大当たり文字・紙吹雪を省く(描画時間・輝度対策)
             trig = bonus
             _draw_fever_outer(frame, w, h, center, radii, hit, age, streak, dragon=trig, fire=bonus)
         else:
-            _draw_rays(frame, center, age)
+            _draw_rays(frame, center, age, qr)
             _draw_confetti(frame, center, radii, hit, age)
             _draw_telop(frame, w, h, center, radii, age, streak)
     if bull:    # ペカり(背景の光は 2倍タイム中は省く: 龍と炎で十分明るい)
@@ -1683,17 +1702,17 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
     if bonus:   # 炎は加算なので、バーストの後に重ねる。龍は bonus_until まで舞い、終了前に去る
         tb, total = now - bonus_start, bonus_until - bonus_start
         glow = np.zeros((h // 4, w // 4, 3), np.uint8)   # 龍・炎・宝珠・稲妻の共通グロー(1/4 解像度)
-        _draw_fire_ring(frame, center, now, _bonus_level(now, bonus_start, bonus_until), _fire_cover(tb, total),
-                        glow, 0.25)
+        _draw_fire_ring(frame, center, now, _bonus_level(now, bonus_start, bonus_until), qr,
+                        _fire_cover(tb, total), glow, 0.25)
         shake = _shake(tb) if intro else (0, 0)
         ca = min(1.0, tb / 0.5) * min(1.0, max(0.0, (total - tb) / 0.8))
         _draw_clouds(frame, tb, ca, shake)
         if intro:
             _draw_bonus_telop(frame, w, h, center, tb, shake)
             _draw_seal(frame, tb, shake)
-        _draw_dragons(frame, center, tb, total, intro, int(bonus_start * 10) & 0xFFFF, glow)
+        _draw_dragons(frame, center, tb, total, intro, int(bonus_start * 10) & 0xFFFF, glow, qr)
     if rstate == "attract" and not bull:
-        _draw_round_attract(frame, w, h, center, round_info, now)
+        _draw_round_attract(frame, w, h, center, radii, round_info, now)
     elif rstate == "result":
         _draw_round_result(frame, w, h, center, radii, round_info, total_score, now)
     if outer:
@@ -1709,7 +1728,7 @@ def render_projector(w: int, h: int, center: tuple[int, int], radii: tuple[int, 
     if outer:      # 演出の下に隠れないよう、四隅マーカーは最後に描き直す
         _draw_corners(frame, w, h)
     if outer:
-        box = (center[0] - QUIET_R, center[1] - QUIET_R, center[0] + QUIET_R + 1, center[1] + QUIET_R + 1)
+        box = (center[0] - qr, center[1] - qr, center[0] + qr + 1, center[1] + qr + 1)
     sl = (slice(max(0, box[1]), min(h, box[3] + 1)), slice(max(0, box[0]), min(w, box[2] + 1)))
     cv2.copyTo(base[sl], st["quiet"][sl], frame[sl])
 
