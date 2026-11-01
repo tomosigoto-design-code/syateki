@@ -7,7 +7,7 @@ import pytest
 
 from syateki import config
 from syateki.app import App
-from syateki.rounds import ATTRACT, PLAYING, RESULT, RoundState, prize_for
+from syateki.rounds import ATTRACT, PLAYING, RESULT, RoundState, prize_for, prize_hint
 
 W, H = config.PROJ_W, config.PROJ_H
 CX, CY = config.TARGET_CENTER
@@ -51,6 +51,16 @@ def test_defaults():
 def test_prize_boundary(score, kind):
     assert prize_for(score)[1] == kind
     assert prize_for(300)[0] == "大きいお菓子" and prize_for(299)[0] == "お菓子"
+
+
+def test_prize_hint(monkeypatch):
+    assert prize_hint() == "5発で300点以上 → 大きいお菓子"
+    assert RoundState().info(0.0)["hint"] == prize_hint()
+    monkeypatch.setattr(config, "SHOTS_PER_ROUND", 3)
+    monkeypatch.setattr(config, "PRIZE_TIERS", [(500, "特大", "big"), (200, "中", "normal"),
+                                                (0, "小", "normal")])
+    assert RoundState().info(0.0)["hint"] == "3発で500点以上 → 特大"
+    assert prize_hint([(0, "お菓子", "normal")]) is None
 
 
 def test_prize_none_when_no_tier_matches():

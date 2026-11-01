@@ -17,6 +17,19 @@ def prize_for(score, tiers=None):
     return None, None
 
 
+def prize_hint(tiers=None, shots=None):
+    """待機画面の呼び込み文 (例: "5発で300点以上 → 大きいお菓子")。最上位 (先頭) の tier を使う。
+
+    tier が1つしかなければ (誰でももらえる) None。
+    """
+    tiers = config.PRIZE_TIERS if tiers is None else tiers
+    shots = config.SHOTS_PER_ROUND if shots is None else shots
+    if len(tiers) < 2:
+        return None
+    need, label, _ = tiers[0]
+    return f"{shots}発で{need}点以上 → {label}"
+
+
 class RoundState:
     def __init__(self):
         self.reset()
@@ -80,7 +93,8 @@ class RoundState:
         """render_projector に渡す round_info。"""
         return {"state": self.state, "shots": self.shots, "max_shots": config.SHOTS_PER_ROUND,
                 "time_left": self.time_left(now), "prize_label": self.prize[0],
-                "prize_kind": self.prize[1], "result_started": self.result_started}
+                "prize_kind": self.prize[1], "result_started": self.result_started,
+                "hint": prize_hint()}
 
     def status(self, now):
         """監視画面用の1行 (ASCII のみ。cv2 の文字は日本語を描けない)。"""
